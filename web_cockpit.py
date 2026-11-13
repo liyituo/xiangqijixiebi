@@ -180,7 +180,7 @@ xiangqi_agent = XiangqiAgent(
     grid_mapper=xiangqi_grid_mapper,
     offset_provider=get_calib_offset,
 )
-cam = CameraStreamThread(0)
+cam = CameraStreamThread()
 
 # 轨迹录制数据容器
 TRAJ_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trajectories")

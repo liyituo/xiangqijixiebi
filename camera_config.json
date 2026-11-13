@@ -1,0 +1,9 @@
+{
+  "device_name": "USB 2.0 Camera",
+  "usb_vid_hex": "0BDA",
+  "usb_pid_hex": "5A63",
+  "device_path": "\\\\?\\usb#vid_0bda&pid_5a63&mi_00#8&540d141&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global",
+  "width_px": 1280,
+  "height_px": 720,
+  "fps": 30
+}

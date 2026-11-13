@@ -1,5 +1,12 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
+set "PROJECT_PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%PROJECT_PYTHON%" (
+    echo 请先运行 0_一键安装环境依赖.bat
+    pause
+    exit /b 1
+)
 title myCobot Pro 450 零重力拖动示教与点位录制
 echo ========================================================
 echo   🤖 myCobot Pro 450 机械臂自由拖动示教与点位录制程序
@@ -13,5 +20,5 @@ if "%ROBOT_IP_INPUT%"=="" set ROBOT_IP_INPUT=192.168.0.232
 echo.
 echo 🚀 正在连接 myCobot Pro 450 (%ROBOT_IP_INPUT%:4500)...
 echo.
-python drag_teach_recorder.py --ip %ROBOT_IP_INPUT%
+"%PROJECT_PYTHON%" drag_teach_recorder.py --ip %ROBOT_IP_INPUT%
 pause

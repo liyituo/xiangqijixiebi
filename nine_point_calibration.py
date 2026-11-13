@@ -23,6 +23,7 @@ import requests
 import numpy as np
 import cv2
 from typing import List, Tuple, Optional
+from camera_device import open_robot_camera
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "calibration_config.json")
 SNAPSHOT_FILE = os.path.join(os.path.dirname(__file__), "current_table_snapshot.jpg")
@@ -59,12 +60,17 @@ def capture_frame() -> Optional[np.ndarray]:
         except Exception:
             pass
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if cap.isOpened():
+    try:
+        cap = open_robot_camera()
+    except RuntimeError as error:
+        print(f"⚠️ {error}")
+        return None
+    try:
         ret, frame = cap.read()
-        cap.release()
         if ret and frame is not None:
             return frame
+    finally:
+        cap.release()
     return None
 
 

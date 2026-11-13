@@ -7,41 +7,22 @@
 import cv2
 import os
 import time
+from camera_device import open_robot_camera
 
 def test_cameras():
     print("=" * 60)
     print("  📷 机械臂视觉摄像头快速检测工具")
     print("=" * 60)
 
-    # 尝试检测可用的摄像头索引（0, 1, 2）
-    available_cams = []
-    for idx in range(3):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                h, w = frame.shape[:2]
-                available_cams.append((idx, w, h))
-            cap.release()
-
-    if not available_cams:
-        print("❌ 未检测到可用的摄像头，请检查 USB 接口是否插好！")
+    try:
+        cap = open_robot_camera()
+    except RuntimeError as error:
+        print(f"❌ {error}")
         return
-
-    print("✅ 检测到以下可用摄像头设备:")
-    for idx, w, h in available_cams:
-        print(f"   -> [设备编号 {idx}]: 默认分辨率 {w} x {h}")
-
-    selected_idx = available_cams[0][0]
-    print(f"\n▶ 正在打开默认设备 [编号 {selected_idx}] 预览实时画面...")
+    print("\n▶ 正在预览已配置的外接摄像头...")
     print("💡 操作提示:")
     print("   - 按键盘 【空格键 (Space)】: 截取当前机械臂桌面画面并保存")
     print("   - 按键盘 【ESC 键 或 Q 键】: 退出预览\n")
-
-    cap = cv2.VideoCapture(selected_idx, cv2.CAP_DSHOW)
-    # 尝试设置较高分辨率
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     save_dir = os.path.join(os.path.dirname(__file__), "captured_images")
     os.makedirs(save_dir, exist_ok=True)

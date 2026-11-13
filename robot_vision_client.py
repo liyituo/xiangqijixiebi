@@ -21,6 +21,7 @@ from typing import Dict, Any, List, Optional
 from vision_calibration import HandEyeMapper
 from vision_tools import VisionActionExecutor, PhysicalSafetyGuard
 from pro450_driver import MyCobotPro450Driver, is_valid_vector, clamp_angles, clamp_coords
+from camera_device import open_robot_camera
 
 # 云服务器多模态 API 接口 (通过 SSH 隧道映射到本地 6006 端口)
 CLOUD_VLM_URL = "http://127.0.0.1:6006/robot_vision_command"
@@ -95,10 +96,13 @@ class EnhancedRobotDriver:
 class CameraStreamThread:
     """常驻后台的低延迟视频流捕获器"""
 
-    def __init__(self, cam_id: int = 0):
-        self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    def __init__(self, cam_id: Optional[int] = None):
+        if cam_id is None:
+            self.cap = open_robot_camera()
+        else:
+            self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.current_frame = None
         self.is_running = True
         self.lock = threading.Lock()
@@ -153,7 +157,7 @@ def main():
     executor = VisionActionExecutor(driver, mapper)
 
     # 2. 启动摄像头后台流
-    cam = CameraStreamThread(0)
+    cam = CameraStreamThread()
     time.sleep(1.0)
     if cam.get_latest_frame() is None:
         print("❌ 未检测到摄像头，请检查 USB 接口！")

@@ -1,5 +1,12 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
+set "PROJECT_PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%PROJECT_PYTHON%" (
+    echo 请先运行 0_一键安装环境依赖.bat
+    pause
+    exit /b 1
+)
 title A4 棋盘格一键高精手眼自动标定系统
 echo ========================================================
 echo   正在启动【A4 棋盘格 54 点高精手眼自动标定系统】...
@@ -9,5 +16,5 @@ echo     2. 窗口将高亮提示 4 个外角点，请将机械臂末端对准�
 echo     3. 按 [D] 键可切换自由拖拽示教，按 [空格键] 一键自动记录坐标；
 echo     4. 采集 4 点后自动扩展拟合全场 54 点矩阵，实现亚毫米级抓取精度！
 echo ========================================================
-python chessboard_auto_calibration.py
+"%PROJECT_PYTHON%" chessboard_auto_calibration.py
 pause

@@ -17,6 +17,7 @@ import json
 import numpy as np
 import cv2
 from typing import Tuple, List, Optional
+from camera_device import open_robot_camera
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "calibration_config.json")
 
@@ -236,9 +237,10 @@ def run_interactive_calibration():
     print("3. 每点击一次，在控制台输入机械臂移动到该物块上方的真实 (X, Y) 坐标；")
     print("4. 全部完成后自动计算透视单应性矩阵并保存。\n")
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        print("❌ 无法打开摄像头。")
+    try:
+        cap = open_robot_camera()
+    except RuntimeError as error:
+        print(f"❌ {error}")
         return
 
     pts = []
