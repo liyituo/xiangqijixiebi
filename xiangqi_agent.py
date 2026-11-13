@@ -294,6 +294,8 @@ class XiangqiAgent:
         )
         self.thread.start()
 
+        return True
+
     def stop_game(self, timeout: float = 4.0):
         """请求停止对弈并有界等待后台线程退出。"""
         with self.lock:
@@ -306,7 +308,7 @@ class XiangqiAgent:
         if worker and worker.is_alive() and threading.current_thread() is not worker:
             worker.join(timeout=timeout)
         with self.lock:
-            if self.thread is worker and not worker.is_alive():
+            if self.thread is worker and (worker is None or not worker.is_alive()):
                 self.thread = None
 
     def clear_fault(self, resume_mode: str = "wait_base"):

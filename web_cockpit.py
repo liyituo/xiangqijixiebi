@@ -214,34 +214,7 @@ def release_pid_lock(pid_file: str = PID_LOCK_FILE) -> None:
 # 初始化硬件与算法组件 (支持 COCKPIT_OFFLINE_INIT=1 免外设测试导入)
 _OFFLINE_INIT = os.environ.get("COCKPIT_OFFLINE_INIT", "").strip().lower() in ("1", "true", "yes")
 mapper = HandEyeMapper()
-if not _OFFLINE_INIT:
-    driver = EnhancedRobotDriver(ROBOT_IP, ROBOT_PORT)
-else:
-    from pro450_driver import MyCobotPro450Driver
-    _stub_backend = MyCobotPro450Driver.__new__(MyCobotPro450Driver)
-    _stub_backend._ensure_runtime_state()
-    _stub_backend.ip = ROBOT_IP
-    _stub_backend.port = ROBOT_PORT
-    _stub_backend.is_connected = False
-    _stub_backend.client = None
-    driver = EnhancedRobotDriver.__new__(EnhancedRobotDriver)
-    driver.ip = ROBOT_IP
-    driver.port = ROBOT_PORT
-    driver.backend = _stub_backend
-    driver.mc = None
-    driver.is_connected = False
-    driver.virtual_coords = _stub_backend.virtual_coords
-    driver.virtual_angles = _stub_backend.virtual_angles
-    driver.virtual_gripper = _stub_backend.virtual_gripper
-    driver.virtual_led = _stub_backend.virtual_led
-    def _fwd(name):
-        return getattr(_stub_backend, name)
-    for _m in ("get_coords", "get_angles", "get_gripper_value", "send_coords", "send_angles",
-               "set_gripper", "set_gripper_value", "init_gripper", "set_color",
-               "emergency_stop", "clear_stop", "get_stop_state", "focus_all_servos",
-               "enable_free_drag", "disable_free_drag", "close"):
-        if not hasattr(driver, _m) or getattr(driver, _m, None) is None:
-            setattr(driver, _m, _fwd(_m))
+driver = EnhancedRobotDriver(ROBOT_IP, ROBOT_PORT, auto_connect=not _OFFLINE_INIT)
 executor = VisionActionExecutor(driver, mapper)
 
 # 全局可重入状态锁 (防嵌套死锁)
@@ -276,13 +249,13 @@ def _on_task_change(record):
     with state_lock:
         telemetry["is_busy"] = task_manager.is_busy
         telemetry["active_task"] = record.to_dict() if task_manager.is_busy else None
-        telemetry["task_history"] = task_manager.get_history(10)
+        telemetry["task_history"] = task_manager.history()[-10:]
 
 
 task_manager = TaskManager(stop_event_provider=_stop_event_provider, on_change=_on_task_change)
 
 if not _OFFLINE_INIT:
-    cam = CameraStreamThread(0)
+    cam = CameraStreamThread()
 else:
     class _StubCamera:
         is_running = False
@@ -292,7 +265,7 @@ else:
         def get_latest_frame(self):
             return None
         def get_latest_frame_with_meta(self):
-            return None, {"frame_id": 0, "timestamp": 0.0, "age_sec": 9999.0, "is_fresh": False, "is_available": False}
+            return None, {"frame_id": 0, "timestamp": 0.0, "age_s": None, "fresh": False, "available": False}
         def release(self):
             pass
     cam = _StubCamera()
@@ -1843,8 +1816,8 @@ def api_video_meta():
         "crop_norm": crop,
         "camera_available": bool(getattr(cam, "is_available", False)),
         "frame_id": meta.get("frame_id", getattr(cam, "frame_id", 0)),
-        "age_sec": meta.get("age_sec"),
-        "is_fresh": meta.get("is_fresh", False),
+        "age_sec": meta.get("age_s"),
+        "is_fresh": meta.get("fresh", False),
         "calibration_available": bool(getattr(mapper, "available", mapper.matrix is not None)),
     })
 
@@ -1853,8 +1826,8 @@ def api_tasks():
     return jsonify(sanitize_for_json({
         "success": True,
         "is_busy": task_manager.is_busy,
-        "active_task": task_manager.get_active(),
-        "history": task_manager.get_history(20),
+        "active_task": task_manager.current_dict(),
+        "history": task_manager.history()[-20:],
     }))
 
 @app.route('/api/tasks/cancel', methods=['POST'])
@@ -1862,7 +1835,7 @@ def api_cancel_task():
     data = request.get_json(silent=True) or {}
     reason = str(data.get("reason", "用户请求取消当前任务"))
     cancelled = task_manager.cancel_current(reason)
-    return jsonify({"success": True, "cancelled": bool(cancelled), "active_task": task_manager.get_active()})
+    return jsonify({"success": True, "cancelled": bool(cancelled), "active_task": task_manager.current_dict()})
 
 @app.route('/api/clear_stop', methods=['POST'])
 def api_clear_stop():
@@ -1895,9 +1868,13 @@ def api_preview_position():
     if frame is None:
         return jsonify({'success': False, 'error': '摄像头画面尚未就绪'}), 503
     h, w = frame.shape[:2]
-    size_ok = mapper.check_frame_size(w, h) if hasattr(mapper, 'check_frame_size') else (not mapper.image_size or list(mapper.image_size) == [w, h])
+    if hasattr(mapper, 'check_frame_size'):
+        size_ok, size_error = mapper.check_frame_size(w, h)
+    else:
+        size_ok = not mapper.image_size or list(mapper.image_size) == [w, h]
+        size_error = '画面尺寸与标定尺寸不一致，请重新核对'
     if not size_ok:
-        return jsonify({'success': False, 'error': '画面尺寸与标定尺寸不一致，请重新核对'}), 400
+        return jsonify({'success': False, 'error': size_error}), 400
     if not mapper.contains_pixel(nx, ny):
         return jsonify({'success': False, 'error': '请选择棋盘标定范围内的点'}), 400
     x_mm, y_mm, _ = mapper.pixel_to_robot(nx, ny)
@@ -1931,8 +1908,8 @@ def api_status():
         _sync_calib_offset_locked()
         if tm is not None:
             telemetry["is_busy"] = bool(tm.is_busy)
-            telemetry["active_task"] = tm.get_active() if tm.is_busy else None
-            telemetry["task_history"] = tm.get_history(10)
+            telemetry["active_task"] = tm.current_dict() if tm.is_busy else None
+            telemetry["task_history"] = tm.history()[-10:]
         if drv is not None and hasattr(drv, "get_stop_state"):
             telemetry["stop_state"] = drv.get_stop_state()
         if cam_obj is not None:
@@ -1974,7 +1951,7 @@ def api_jog_cartesian():
     if not math.isfinite(delta):
         return jsonify({"success": False, "error": "点动步长必须为有限数字"}), 400
 
-    def _op(token):
+    def _op(token, _record):
         with state_lock:
             _release_drag_teach_if_needed_locked()
         res = executor.jog_cartesian(axis, delta)
@@ -1986,7 +1963,7 @@ def api_jog_cartesian():
         return res
 
     try:
-        res = task_manager.run_sync("jog_cartesian", _op, meta={"axis": axis, "delta": delta})
+        res = task_manager.run_sync("jog_cartesian", _op, description=f"{axis} {delta:+g}")
         return jsonify(res)
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
@@ -2005,7 +1982,7 @@ def api_jog_joint():
     if not math.isfinite(delta_deg):
         return jsonify({"success": False, "error": "关节点动角度必须为有限数字"}), 400
 
-    def _op(token):
+    def _op(token, _record):
         with state_lock:
             _release_drag_teach_if_needed_locked()
         res = executor.jog_joint(joint_idx, delta_deg)
@@ -2017,7 +1994,7 @@ def api_jog_joint():
         return res
 
     try:
-        res = task_manager.run_sync("jog_joint", _op, meta={"joint_idx": joint_idx, "delta_deg": delta_deg})
+        res = task_manager.run_sync("jog_joint", _op, description=f"J{joint_idx} {delta_deg:+g}")
         return jsonify(res)
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
@@ -2033,13 +2010,13 @@ def api_gripper_slider():
     except (TypeError, ValueError):
         return jsonify({"success": False, "error": "夹爪开度参数无效"}), 400
 
-    def _op(token):
+    def _op(token, _record):
         res = executor.control_gripper(value_percent=val)
         refresh_pose()
         return res
 
     try:
-        return jsonify(task_manager.run_sync("gripper_slider", _op, meta={"value": val}))
+        return jsonify(task_manager.run_sync("gripper_slider", _op, description=f"夹爪开度 {val}%"))
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
 
@@ -2049,7 +2026,7 @@ def api_init_gripper():
     blocked = reject_if_busy()
     if blocked: return blocked
 
-    def _op(token):
+    def _op(token, _record):
         ok = driver.init_gripper(14)
         val = driver.get_gripper_value(allow_cache=False) if hasattr(driver, "get_gripper_value") else 0
         with state_lock:
@@ -2076,7 +2053,7 @@ def api_move_station():
     if st not in PRESET_JOINTS and st not in PRESET_STATIONS:
         return jsonify({"success": False, "error": f"未知工位 {st!r}，拒绝执行"}), 400
 
-    def _op(token):
+    def _op(token, _record):
         with state_lock:
             _release_drag_teach_if_needed_locked()
         add_log(f"快速巡航至工位: 【{st}】")
@@ -2085,7 +2062,7 @@ def api_move_station():
         return res
 
     try:
-        return jsonify(task_manager.run_sync("move_station", _op, meta={"station": st}))
+        return jsonify(task_manager.run_sync("move_station", _op, description=st))
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
 
@@ -2097,7 +2074,7 @@ def api_drag_teach():
     data = request.get_json(silent=True) or {}
     enable = bool(data.get("enable", False))
 
-    def _op(token):
+    def _op(token, _record):
         res = executor.set_drag_teach(enable)
         if res.get("success"):
             with state_lock:
@@ -2106,7 +2083,7 @@ def api_drag_teach():
         return res
 
     try:
-        return jsonify(task_manager.run_sync("drag_teach", _op, meta={"enable": enable}))
+        return jsonify(task_manager.run_sync("drag_teach", _op, description=f"拖拽示教 {enable}"))
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
 
@@ -2182,31 +2159,31 @@ def api_replay_waypoints():
 
     add_log(f"🚀 启动轨迹回放: 共 {len(snapshot)} 个点位...")
 
-    def replay_worker(token):
+    def replay_worker(token, _record):
         executor.set_drag_teach(False)
         with state_lock:
             telemetry["drag_teach"] = False
-        token.sleep(0.5)
+        token.wait(0.5)
         for i, wp in enumerate(snapshot):
-            token.raise_if_cancelled()
+            token.check()
             add_log(f"▶️ 回放 [{i+1}/{len(snapshot)}] -> 【{wp['name']}】")
             ok_g = driver.set_gripper_value(wp["gripper_percent"], speed=60)
             if ok_g is False:
                 raise RuntimeError(f"第 {i+1} 个点位夹爪设置失败")
-            token.raise_if_cancelled()
+            token.check()
             try:
                 ok_m = driver.send_angles(wp["joint_angles_deg"], speed=15, cancel_token=token)
             except TypeError:
                 ok_m = driver.send_angles(wp["joint_angles_deg"], speed=15)
             if ok_m is False:
                 raise RuntimeError(f"第 {i+1} 个点位关节移动失败或被取消")
-            token.sleep(0.4)
+            token.wait(0.4)
         add_log("🎉 轨迹回放执行完成！")
         return {"success": True, "replayed": len(snapshot)}
 
     try:
-        record = task_manager.try_start("replay_waypoints", replay_worker, meta={"total": len(snapshot)})
-        return jsonify({"success": True, "task_id": record.task_id})
+        record = task_manager.try_start("replay_waypoints", replay_worker, description=f"回放 {len(snapshot)} 个点位")
+        return jsonify({"success": True, "task_id": record.id})
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
 
@@ -2228,7 +2205,7 @@ def api_scan():
     telemetry["current_step"] = "正在启动巡检扫描..."
     telemetry["step_progress"] = 15
 
-    def scan_worker(token):
+    def scan_worker(token, _record):
         def scan_cb(code, desc, pct=50):
             telemetry["current_step"] = f"巡检中: {desc}"
             telemetry["step_progress"] = pct
@@ -2240,7 +2217,7 @@ def api_scan():
         except TypeError:
             executor.scan_workspace(scan_cb)
 
-        token.raise_if_cancelled()
+        token.check()
         fresh_frame = cam.get_latest_frame()
         if fresh_frame is not None:
             objs = detect_all_table_objects(fresh_frame, mapper=mapper)
@@ -2260,7 +2237,7 @@ def api_scan():
 
     try:
         record = task_manager.try_start("scan", scan_worker)
-        return jsonify({"success": True, "task_id": record.task_id})
+        return jsonify({"success": True, "task_id": record.id})
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
 
@@ -2273,7 +2250,7 @@ def api_openvla_step():
     act_7d = data.get("action_7d", [0.0] * 7)
     action_spec = str(data.get("action_spec", "bridge_unnormalized"))
 
-    def _op(token):
+    def _op(token, _record):
         with state_lock:
             _release_drag_teach_if_needed_locked()
         try:
@@ -2323,7 +2300,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
         _release_drag_teach_if_needed_locked()
 
     try:
-        token.raise_if_cancelled()
+        token.check()
         with state_lock:
             telemetry["current_step"] = "正在理解具身意图与规划动作..."
             telemetry["step_progress"] = 10
@@ -2365,7 +2342,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
                         telemetry["cloud_status"] = "OFFLINE"
                     add_log("⚡ [智能边缘引擎接管]: 云端模型离线，本地规则解析接管调度！")
 
-        token.raise_if_cancelled()
+        token.check()
         parsed = parse_instruction(instruction, model_result=cloud_result)
 
         # 自然语言问答 / 查询意图拦截
@@ -2422,7 +2399,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
             add_log("👋 机械臂挥手互动中...")
             norm_j = list(PRESET_JOINTS["NORMAL"])
             for offset in (25.0, -25.0, 25.0):
-                token.raise_if_cancelled()
+                token.check()
                 try:
                     driver.send_angles([norm_j[0], norm_j[1], norm_j[2], norm_j[3], norm_j[4] + offset, norm_j[5]], 25, cancel_token=token)
                 except TypeError:
@@ -2450,7 +2427,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
                 executor.scan_workspace(scan_cb, cancel_token=token)
             except TypeError:
                 executor.scan_workspace(scan_cb)
-            token.raise_if_cancelled()
+            token.check()
             fresh_frame = cam.get_latest_frame()
             all_objs = detect_all_table_objects(fresh_frame, mapper=mapper) if fresh_frame is not None else []
             with state_lock:
@@ -2511,7 +2488,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
                 executor.scan_workspace(scan_cb, cancel_token=token)
             except TypeError:
                 executor.scan_workspace(scan_cb)
-            token.sleep(0.4)
+            token.wait(0.4)
 
         with state_lock:
             off_x = telemetry.get("calib_offset_x", 0.0)
@@ -2529,10 +2506,10 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
         attempted_centers: List[Tuple[float, float]] = []
 
         for loop_idx in range(max_loops):
-            token.raise_if_cancelled()
+            token.check()
             fresh_frame = cam.get_latest_frame()
             if fresh_frame is None:
-                token.sleep(0.5)
+                token.wait(0.5)
                 fresh_frame = cam.get_latest_frame()
 
             if is_batch:
@@ -2628,7 +2605,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
                 if not is_batch:
                     break
 
-            token.sleep(0.6)
+            token.wait(0.6)
 
         with state_lock:
             if success_count > 0:
@@ -2689,10 +2666,10 @@ def api_command():
     try:
         record = task_manager.try_start(
             "command",
-            lambda tok: execute_embodied_instruction(instruction, cancel_token=tok),
-            meta={"instruction": instruction[:80]},
+            lambda tok, _record: execute_embodied_instruction(instruction, cancel_token=tok),
+            description=instruction[:80],
         )
-        return jsonify({"success": True, "task_id": record.task_id, "msg": "指令已受理，正在后台执行"})
+        return jsonify({"success": True, "task_id": record.id, "msg": "指令已受理，正在后台执行"})
     except RobotBusyError as e:
         return jsonify({"success": False, "error": str(e)}), 409
 
@@ -2738,7 +2715,7 @@ def api_click_pick():
         if cam_obj is not None:
             if hasattr(cam_obj, "get_latest_frame_with_meta"):
                 fresh_frame, meta = cam_obj.get_latest_frame_with_meta()
-                if not meta.get("is_available", fresh_frame is not None) or not meta.get("is_fresh", True):
+                if not meta.get("available", fresh_frame is not None) or not meta.get("fresh", False):
                     with state_lock:
                         telemetry["is_busy"] = False
                     return jsonify({"success": False, "error": "摄像头画面未就绪或已过期，请检查相机"}), 503
@@ -2751,8 +2728,9 @@ def api_click_pick():
 
             if fresh_frame is not None and hasattr(mapper, "check_frame_size"):
                 fh, fw = fresh_frame.shape[:2]
-                if not mapper.check_frame_size(fw, fh):
-                    raise ValueError(f"相机分辨率 {fw}x{fh} 与标定分辨率不一致")
+                size_ok, size_error = mapper.check_frame_size(fw, fh)
+                if not size_ok:
+                    raise ValueError(size_error)
 
         # 自动解除拖拽示教并复位电机扭矩 (防止掉使能报错)
         with state_lock:
@@ -2957,7 +2935,7 @@ def api_manual():
 
     if act == "open_gripper":
         try:
-            res = task_manager.run_sync("manual_open_gripper", lambda tok: executor.control_gripper("OPEN"))
+            res = task_manager.run_sync("manual_open_gripper", lambda tok, _record: executor.control_gripper("OPEN"))
             add_log("夹爪打开 (15%)")
             refresh_pose()
             return jsonify(res)
@@ -2965,7 +2943,7 @@ def api_manual():
             return jsonify({"success": False, "error": str(e)}), 409
     elif act == "close_gripper":
         try:
-            res = task_manager.run_sync("manual_close_gripper", lambda tok: executor.control_gripper("CLOSE"))
+            res = task_manager.run_sync("manual_close_gripper", lambda tok, _record: executor.control_gripper("CLOSE"))
             add_log("夹爪闭合 (5%)")
             refresh_pose()
             return jsonify(res)
@@ -3047,7 +3025,7 @@ def api_xiangqi_endgame_detect():
 
         if hasattr(cam, "get_latest_frame_with_meta"):
             frame, meta = cam.get_latest_frame_with_meta()
-            if not meta.get("is_fresh", True):
+            if not meta.get("fresh", False):
                 return jsonify({"success": False, "error": "摄像头画面已过期或不可用"}), 503
         else:
             frame = cam.get_latest_frame()
@@ -3143,7 +3121,7 @@ def cleanup_and_exit(signum=None, frame=None):
     except Exception:
         pass
     try:
-        xiangqi_agent.close(timeout=3.0)
+        xiangqi_agent.close()
     except Exception:
         pass
     try:

@@ -23,6 +23,7 @@ import requests
 import numpy as np
 import cv2
 from typing import List, Tuple, Optional
+from camera_device import open_robot_camera
 
 from vision_calibration import save_calibration
 
@@ -61,12 +62,17 @@ def capture_frame() -> Optional[np.ndarray]:
         except Exception:
             pass
 
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if cap.isOpened():
+    try:
+        cap = open_robot_camera()
+    except RuntimeError as error:
+        print(f"⚠️ {error}")
+        return None
+    try:
         ret, frame = cap.read()
-        cap.release()
         if ret and frame is not None:
             return frame
+    finally:
+        cap.release()
     return None
 
 

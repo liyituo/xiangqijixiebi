@@ -30,7 +30,7 @@ class FakeDriver:
 
 
 class GraspHeightTest(unittest.TestCase):
-    def test_grasp_is_10_mm_below_previous_target(self):
+    def test_grasp_and_hover_use_configured_table_offsets(self):
         driver = FakeDriver()
         executor = VisionActionExecutor(driver, FakeMapper())
         with patch('vision_tools.time.sleep'), contextlib.redirect_stdout(io.StringIO()):
@@ -38,7 +38,7 @@ class GraspHeightTest(unittest.TestCase):
 
         self.assertTrue(result['success'])
         self.assertEqual([coords[2] for coords in driver.cartesian_commands[:3]],
-                         [310.0, 187.0, 310.0])
+                         [234.0, 187.0, 234.0])
 
     def test_manual_z_trim_still_applies(self):
         driver = FakeDriver()

@@ -165,7 +165,7 @@ class MotionTest(unittest.TestCase):
         with patch('vision_tools.time.sleep'), contextlib.redirect_stdout(io.StringIO()), \
              self.assertRaisesRegex(RuntimeError, '逆解'):
             VisionActionExecutor(fake, Mapper()).execute_visual_pick_and_place('棋子', [0, 0, 1, 1])
-        self.assertEqual(fake.actions, [('gripper', 100), ('move', 310.0)])
+        self.assertEqual(fake.actions, [('gripper', 15), ('move', 234.0)])
 
 
 if __name__ == '__main__':

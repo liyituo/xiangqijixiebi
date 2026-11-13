@@ -29,6 +29,7 @@ from typing import List, Tuple, Optional, Dict, Any
 
 from pro450_driver import MyCobotPro450Driver
 from vision_calibration import save_calibration
+from camera_device import open_robot_camera
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "calibration_config.json")
 RESULT_IMG_FILE = os.path.join(os.path.dirname(__file__), "chessboard_calibration_result.jpg")
@@ -169,12 +170,11 @@ def run_chessboard_auto_calibration():
         print("⚠️ 机械臂未连接或网络离线，将支持控制台手动输入坐标。")
 
     # 2. 打开摄像头
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    try:
+        cap = open_robot_camera()
+    except RuntimeError as error:
         cap = None
-        print("⚠️ 无法直接打开 DirectShow 摄像头，将尝试从网络大屏或最新快照读取。")
+        print(f"⚠️ {error}，将尝试从网络大屏或最新快照读取。")
 
     # 3. 准备标定循环
     window_name = "A4 Chessboard Auto Calibration (Space: Sample | D: Free Drag | ESC: Exit)"

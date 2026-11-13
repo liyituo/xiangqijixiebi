@@ -1,5 +1,12 @@
 @echo off
 chcp 65001 >nul
+cd /d "%~dp0"
+set "PROJECT_PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%PROJECT_PYTHON%" (
+    echo 请先运行 0_一键安装环境依赖.bat
+    pause
+    exit /b 1
+)
 title 中国象棋棋盘高精全自动定位程序 - myCobot Pro 450
 color 0b
 
@@ -12,7 +19,7 @@ echo [提示] 正在调用相机拍照并进行棋盘四角 (a0, i0, i9, a9) 自
 echo [提示] 若网页控制大屏 (web_cockpit) 正在运行，定位完成后将自动热更新网格！
 echo.
 
-python xiangqi_auto_locate.py
+"%PROJECT_PYTHON%" xiangqi_auto_locate.py
 
 echo.
 echo ======================================================================

@@ -14,6 +14,7 @@ import re
 import requests
 import numpy as np
 import cv2
+from camera_device import open_robot_camera
 
 from env_loader import get_vlm_api_key
 from vision_calibration import save_calibration
@@ -61,12 +62,13 @@ def capture_fresh_frame() -> np.ndarray:
             return cv2.imdecode(np.frombuffer(f.read(), np.uint8), cv2.IMREAD_COLOR)
 
     # 尝试直连相机
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    if cap.isOpened():
+    cap = open_robot_camera()
+    try:
         ret, frame = cap.read()
-        cap.release()
         if ret and frame is not None:
             return frame
+    finally:
+        cap.release()
 
     raise RuntimeError("无法捕获工作台画面，请确认摄像头或网页大屏已开启！")
 

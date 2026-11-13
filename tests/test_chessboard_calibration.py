@@ -1,7 +1,9 @@
 """棋盘定位和预览接口检查；不会连接摄像头或机械臂。"""
 
 import ast
+import json
 import math
+import tempfile
 import threading
 import time
 import unittest
@@ -45,7 +47,19 @@ def make_preview_app(mapper, camera, telemetry):
 
 class ChessboardPreviewTest(unittest.TestCase):
     def setUp(self):
-        self.mapper = HandEyeMapper(str(ROOT / 'calibration_config.json'))
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config = {
+            'image_points': [[200, 200], [800, 200], [800, 800], [200, 800]],
+            'robot_points': [[139.4, 192.4], [418.9, 147.4], [403.4, -181.3], [105.8, -206.4]],
+            'image_size_px': [1280, 720],
+            'board_grid': {'columns': 9, 'rows': 10},
+            'table_z_mm': 189.0,
+            'hover_clearance_mm': 310.0,
+        }
+        config_path = Path(directory.name) / 'calibration_config.json'
+        config_path.write_text(json.dumps(config), encoding='utf-8')
+        self.mapper = HandEyeMapper(str(config_path))
         self.camera = FakeCamera()
         self.telemetry = {'calib_offset_x': 0.0, 'calib_offset_y': 0.0}
         self.client = make_preview_app(self.mapper, self.camera, self.telemetry).test_client()

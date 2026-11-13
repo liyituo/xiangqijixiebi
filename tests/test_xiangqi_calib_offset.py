@@ -28,6 +28,11 @@ class TestHandEyeMapperOffsetPersistence(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.tmp_calib = os.path.join(self.tmpdir.name, "calibration_config.json")
         shutil.copy2(CALIB_SRC, self.tmp_calib)
+        with open(self.tmp_calib, "r", encoding="utf-8") as config_file:
+            fixture = json.load(config_file)
+        fixture["manual_offset_mm"] = [0.0, 0.0, 0.0]
+        with open(self.tmp_calib, "w", encoding="utf-8") as config_file:
+            json.dump(fixture, config_file)
 
     def tearDown(self):
         self.tmpdir.cleanup()
@@ -287,6 +292,8 @@ class TestWebCockpitOffsetWiring(unittest.TestCase):
         agent_mock.last_red_move = "--"
         agent_mock.last_black_move = "--"
         agent_mock.move_history = []
+        agent_mock.fault_info = None
+        agent_mock.game_id = 0
 
         grid_mock = MagicMock()
         grid_mock.corners_norm = {"a0": [100, 100], "i0": [900, 100], "i9": [900, 900], "a9": [100, 900]}

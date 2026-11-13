@@ -15,9 +15,13 @@ let confirmations = 0;
 let allowPick = false;
 let alertMessage = '';
 let confirmationMessage = '';
+let apiToken = '';
 const context = {
   window: { addEventListener() {} },
-  document: { getElementById(id) { return id === 'clickMode' ? mode : output; } },
+  document: {
+    getElementById(id) { return id === 'clickMode' ? mode : output; },
+    querySelector() { return { getAttribute: () => apiToken }; },
+  },
   setInterval() {},
   confirm(message) { confirmations += 1; confirmationMessage = message; return allowPick; },
   alert(message) { alertMessage = message; },
@@ -65,6 +69,13 @@ setImmediate(() => {
     assert.strictEqual(calls[before].url, '/api/calib_offset');
     assert.deepStrictEqual(JSON.parse(calls[before].options.body), { axis, delta: Number(delta) });
   }
-  console.log('抓取确认、定位预览和 1 mm 偏置按钮检查通过');
+  vm.runInContext('latestFocusCropNorm = [200, 100, 600, 700]', context);
+  const mapped = context.mapCanvasClickToRawNorm(click.target, click);
+  assert.strictEqual(mapped.normX, 400);
+  assert.strictEqual(mapped.normY, 400);
+  apiToken = 'test-token';
+  context.apiFetch('/api/status');
+  assert.strictEqual(calls.at(-1).options.headers['X-API-Token'], 'test-token');
+  console.log('抓取确认、定位预览、偏置按钮、裁剪坐标转换及请求认证检查通过');
   });
 });

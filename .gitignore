@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
+.venv-openvla/
 venv/
 .pytest_cache/
 

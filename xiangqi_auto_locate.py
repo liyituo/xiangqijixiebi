@@ -31,6 +31,7 @@ from typing import Dict, Any, Tuple, Optional
 from env_loader import get_vlm_api_key
 from vision_calibration import HandEyeMapper
 from xiangqi_agent import XiangqiGridMapper
+from camera_device import open_robot_camera
 
 API_KEY = get_vlm_api_key("VLM_API_KEY", "DEEPSEEK_API_KEY")
 API_URL = os.environ.get("VLM_API_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions")
@@ -53,14 +54,15 @@ def get_fresh_frame() -> Optional[np.ndarray]:
         pass
 
     try:
-        cap = cv2.VideoCapture(0)
-        if cap.isOpened():
+        cap = open_robot_camera()
+        try:
             for _ in range(5):
                 cap.read() # 丢弃预热帧
             ret, frame = cap.read()
-            cap.release()
             if ret and frame is not None:
                 return frame
+        finally:
+            cap.release()
     except Exception:
         pass
 

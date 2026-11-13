@@ -21,6 +21,7 @@ from typing import Dict, Any, List, Optional, Tuple
 from vision_calibration import HandEyeMapper
 from vision_tools import VisionActionExecutor, PhysicalSafetyGuard, PRESET_JOINTS
 from pro450_driver import MyCobotPro450Driver, is_valid_vector, clamp_angles, clamp_coords
+from camera_device import open_robot_camera
 
 # 云服务器多模态 API 接口 (通过 SSH 隧道映射到本地 6006 端口)
 CLOUD_VLM_URL = "http://127.0.0.1:6006/robot_vision_command"
@@ -32,10 +33,12 @@ ROBOT_PORT = 4500
 class EnhancedRobotDriver:
     """兼具角度控制、笛卡尔空间点动、夹爪精细调谐与状态反馈的工业驱动器 (myCobot Pro 450 优化版)"""
 
-    def __init__(self, ip: str = ROBOT_IP, port: int = ROBOT_PORT):
+    def __init__(self, ip: str = ROBOT_IP, port: int = ROBOT_PORT, auto_connect: bool = True):
         self.ip = ip
         self.port = port
-        self.backend = MyCobotPro450Driver(ip=self.ip, port=self.port, auto_scan=True)
+        self.backend = MyCobotPro450Driver(
+            ip=self.ip, port=self.port, auto_scan=True, auto_connect=auto_connect
+        )
         self.mc = self.backend.client
         self.is_connected = self.backend.is_connected
         self.virtual_coords = self.backend.virtual_coords
@@ -43,37 +46,37 @@ class EnhancedRobotDriver:
         self.virtual_gripper = self.backend.virtual_gripper
         self.virtual_led = self.backend.virtual_led
 
-    def get_coords(self) -> List[float]:
+    def get_coords(self, allow_cache: bool = True) -> Optional[List[float]]:
         """获取末端笛卡尔坐标 [x, y, z, rx, ry, rz]"""
-        return self.backend.get_coords()
+        return self.backend.get_coords(allow_cache=allow_cache)
 
-    def get_angles(self) -> List[float]:
+    def get_angles(self, allow_cache: bool = True) -> Optional[List[float]]:
         """获取各关节角度 [j1, j2, j3, j4, j5, j6]"""
-        return self.backend.get_angles()
+        return self.backend.get_angles(allow_cache=allow_cache)
 
-    def get_gripper_value(self) -> int:
+    def get_gripper_value(self, allow_cache: bool = True) -> Optional[int]:
         """获取当前夹爪开度 (0~100)"""
-        return self.backend.get_gripper_value()
+        return self.backend.get_gripper_value(allow_cache=allow_cache)
 
-    def send_coords(self, coords: List[float], speed: int = 15):
+    def send_coords(self, coords: List[float], speed: int = 15, **kwargs):
         """驱动机械臂末端到达笛卡尔坐标 [x, y, z, rx, ry, rz]"""
-        self.backend.send_coords(coords, speed)
+        return self.backend.send_coords(coords, speed, **kwargs)
 
-    def send_angles(self, angles: List[float], speed: int = 15):
+    def send_angles(self, angles: List[float], speed: int = 15, **kwargs):
         """驱动机械臂 6 个关节到指定角度"""
-        self.backend.send_angles(angles, speed)
+        return self.backend.send_angles(angles, speed, **kwargs)
 
     def init_gripper(self, gripper_id: int = 14) -> bool:
         """初始化 Pro 自适应电动夹爪"""
         return self.backend.init_gripper(gripper_id)
 
-    def set_gripper(self, action: str, speed: int = 50):
+    def set_gripper(self, action: str, speed: int = 50, **kwargs):
         """离散控制夹爪开合 (OPEN/CLOSE)"""
-        self.backend.set_gripper(action, speed)
+        return self.backend.set_gripper(action, speed, **kwargs)
 
-    def set_gripper_value(self, value: int, speed: int = 50):
+    def set_gripper_value(self, value: int, speed: int = 50, **kwargs):
         """连续百分比控制夹爪开度 (0~100)"""
-        self.backend.set_gripper_value(value, speed)
+        return self.backend.set_gripper_value(value, speed, **kwargs)
 
     def set_color(self, r: int, g: int, b: int):
         """设置机械臂头部 RGB 指示灯"""
@@ -81,29 +84,50 @@ class EnhancedRobotDriver:
 
     def release_all_servos(self):
         """释放所有关节舵机扭矩 / 降低阻尼 (自由拖拽示教)"""
-        self.backend.enable_free_drag()
+        return self.backend.enable_free_drag()
 
     def focus_all_servos(self):
         """锁定所有关节舵机扭矩 (恢复上电刚性保持)"""
-        self.backend.disable_free_drag()
+        return self.backend.disable_free_drag()
 
     def emergency_stop(self):
         """硬件急停制动"""
-        self.backend.emergency_stop()
+        return self.backend.emergency_stop()
+
+    def get_gripper_feedback(self):
+        return self.backend.get_gripper_feedback()
+
+    def get_stop_state(self):
+        return self.backend.get_stop_state()
+
+    def clear_stop(self):
+        return self.backend.clear_stop()
+
+    def close(self):
+        self.backend.close()
+        self.mc = None
+        self.is_connected = False
 
 
 class CameraStreamThread:
     """常驻后台的低延迟视频流捕获器 (带帧序号、时间戳、断流计次与可用性状态)"""
 
-    def __init__(self, cam_id: int = 0):
+    def __init__(self, cam_id: Optional[int] = None):
         self.cam_id = cam_id
-        self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
-        if self.cap is not None and self.cap.isOpened():
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-            self.last_error: Optional[str] = None
+        self.last_error: Optional[str] = None
+        if cam_id is None:
+            try:
+                self.cap = open_robot_camera()
+            except RuntimeError as error:
+                self.cap = None
+                self.last_error = str(error)
         else:
-            self.last_error = f"无法打开摄像头 (cam_id={cam_id})"
+            self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        if self.cap is None or not self.cap.isOpened():
+            self.last_error = self.last_error or f"无法打开摄像头 (cam_id={cam_id})"
         self.current_frame: Optional[np.ndarray] = None
         self.frame_id: int = 0
         self.frame_timestamp: float = 0.0
@@ -220,7 +244,7 @@ def main():
     executor = VisionActionExecutor(driver, mapper)
 
     # 2. 启动摄像头后台流
-    cam = CameraStreamThread(0)
+    cam = CameraStreamThread()
     time.sleep(1.0)
     if cam.get_latest_frame() is None:
         print("❌ 未检测到摄像头，请检查 USB 接口！")

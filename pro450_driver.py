@@ -122,7 +122,8 @@ def clamp_coords(coords: List[float], safety_z_min: float = 20.0) -> List[float]
 class MyCobotPro450Driver:
     """myCobot Pro 450 专属工业级通信驱动适配器"""
 
-    def __init__(self, ip: str = DEFAULT_ROBOT_IP, port: int = DEFAULT_ROBOT_PORT, auto_scan: bool = True):
+    def __init__(self, ip: str = DEFAULT_ROBOT_IP, port: int = DEFAULT_ROBOT_PORT,
+                 auto_scan: bool = True, auto_connect: bool = True):
         self.ip = ip
         self.port = port
         self.auto_scan = auto_scan
@@ -142,7 +143,17 @@ class MyCobotPro450Driver:
         self._ensure_runtime_state()
 
         # 尝试连接
-        self.connect()
+        if auto_connect:
+            self.connect()
+
+    def close(self):
+        """释放本实例的网络连接。"""
+        with self.lock:
+            client = self.client
+            self.client = None
+            self.is_connected = False
+            if client is not None:
+                client.close()
 
     def _ensure_runtime_state(self):
         """惰性初始化运行期状态字段，兼容 __new__ 构造的离线测试桩。"""
