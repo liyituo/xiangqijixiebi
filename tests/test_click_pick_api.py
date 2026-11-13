@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from flask import Flask, jsonify, request
+from motion_tasks import TaskManager
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +40,7 @@ class FakeExecutor:
         return self.result
 
 
-def make_app(telemetry, executor, logs, connected=True):
+def make_app(telemetry, executor, logs, connected=True, task_manager=None):
     tree = ast.parse((ROOT / 'web_cockpit.py').read_text(encoding='utf-8'))
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'api_click_pick')
     function.decorator_list = []
@@ -51,6 +52,7 @@ def make_app(telemetry, executor, logs, connected=True):
         'mapper': SimpleNamespace(pixel_to_robot=lambda x, y: (200.0, 0.0, 189.0)),
         'add_log': logs.append, 'refresh_pose': lambda: None,
         'threading': SimpleNamespace(Thread=InlineThread),
+        'task_manager': task_manager,
     }
     exec(compile(module, 'web_cockpit.py', 'exec'), scope)
     app = Flask(__name__)
@@ -101,6 +103,29 @@ class ClickPickApiTest(unittest.TestCase):
         self.assertEqual(self.executor.received[-1][0][2], 'P5')
         self.client.post('/api/click_pick', json={'norm_x': 500, 'norm_y': 500, 'target_station': 'P3'})
         self.assertEqual(self.executor.received[-1][0][2], 'P3')
+
+    def test_click_runs_with_real_task_manager_callback(self):
+        finished = threading.Event()
+
+        def on_change(record):
+            if record.state in ('succeeded', 'failed', 'cancelled'):
+                finished.set()
+
+        manager = TaskManager(on_change=on_change)
+        self.executor.result = {'success': True}
+        client = make_app(self.telemetry, self.executor, self.logs,
+                          task_manager=manager).test_client()
+        response = client.post('/api/click_pick', json={'norm_x': 500, 'norm_y': 500})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json['success'])
+        self.assertTrue(finished.wait(2.0))
+        record = manager.last()
+        self.assertEqual(record.state, 'succeeded')
+        self.assertEqual(record.description, '点击抓取至 P5')
+        self.assertEqual(self.executor.calls, 1)
+        self.assertIs(self.executor.received[0][1]['cancel_token'], record.token)
+        self.assertFalse(self.telemetry['is_busy'])
 
 
 if __name__ == '__main__':

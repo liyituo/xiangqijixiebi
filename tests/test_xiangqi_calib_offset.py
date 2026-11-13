@@ -168,7 +168,7 @@ class TestXiangqiGridAndAgentOffsets(unittest.TestCase):
 
     @staticmethod
     def _extract_pick_and_place_targets(coords):
-        # 执行顺序依次为: 抓取悬停 -> 抓取点 -> 抬起 -> 放置悬停 -> 放置点
+        # 用局部低点检查接近棋盘的抓取或放置动作。
         # 局部极小 Z 点对应抓取点与放置点
         surface_pts = []
         for idx, pt in enumerate(coords):
@@ -195,9 +195,12 @@ class TestXiangqiGridAndAgentOffsets(unittest.TestCase):
         with patch.object(vision_tools.time, "sleep", return_value=None):
             agent._physical_move_piece("e7", "e5")
             base_surfaces = self._extract_pick_and_place_targets(driver.send_coords_history)
-            self.assertEqual(len(base_surfaces), 2)
-            base_pick, base_place = base_surfaces
-            self.assertAlmostEqual(base_place[2] - base_pick[2], 2.0, places=1)
+            self.assertEqual(len(base_surfaces), 1)
+            base_pick = base_surfaces[0]
+            base_place = driver.send_coords_history[-1]
+            self.assertEqual(len(driver.send_coords_history), 4)
+            self.assertEqual(base_place[2], driver.send_coords_history[0][2])
+            self.assertEqual(driver.gripper_history, [17, 5, 17])
 
             # 对弈中途手动调整微调偏置，无需重启智能体即应立即生效
             driver.send_coords_history.clear()
@@ -205,26 +208,30 @@ class TestXiangqiGridAndAgentOffsets(unittest.TestCase):
             current_offset[:] = [4.0, -3.0, 2.0]
             agent._physical_move_piece("e7", "e5")
             shifted_surfaces = self._extract_pick_and_place_targets(driver.send_coords_history)
-            self.assertEqual(len(shifted_surfaces), 2)
-            shifted_pick, shifted_place = shifted_surfaces
+            self.assertEqual(len(shifted_surfaces), 1)
+            shifted_pick = shifted_surfaces[0]
+            shifted_place = driver.send_coords_history[-1]
 
-            # 拾取点与落子点均严格按 (+4.0, -3.0, +2.0) 平移且无二次叠加
+            # 抓取点应用 XYZ 微调，释放点在安全高度应用 XY 微调。
             self.assertAlmostEqual(shifted_pick[0] - base_pick[0], 4.0, places=1)
             self.assertAlmostEqual(shifted_pick[1] - base_pick[1], -3.0, places=1)
             self.assertAlmostEqual(shifted_pick[2] - base_pick[2], 2.0, places=1)
 
             self.assertAlmostEqual(shifted_place[0] - base_place[0], 4.0, places=1)
             self.assertAlmostEqual(shifted_place[1] - base_place[1], -3.0, places=1)
-            self.assertAlmostEqual(shifted_place[2] - base_place[2], 2.0, places=1)
-            self.assertAlmostEqual(shifted_place[2] - shifted_pick[2], 2.0, places=1)
+            self.assertEqual(shifted_place[2], driver.send_coords_history[0][2])
+            self.assertGreaterEqual(shifted_place[2], shifted_pick[2] + vision_tools.VisionConfig.CLEARANCE_MARGIN_MM)
 
-            # 吃子丢入弃子盒 P4：仅对棋盘拾取点生效，P4 固定工位不偏移
+            # 吃子丢入弃子盒 P5，工位 XY 使用示教坐标。
             driver.send_coords_history.clear()
             driver.send_angles_history.clear()
-            agent._physical_pick_and_place_square("e5", dest_station="P4")
+            driver.gripper_history.clear()
+            agent._physical_pick_and_place_square("e5")
+            self.assertEqual(driver.gripper_history, [17, 5, 17])
             capture_z_vals = [round(c[2], 1) for c in driver.send_coords_history]
             self.assertIn(round(base_pick[2] + 2.0, 1), capture_z_vals)
-            self.assertIn(vision_tools.PRESET_JOINTS["P4"], driver.send_angles_history)
+            self.assertEqual(driver.send_coords_history[-1][:2], vision_tools.PRESET_STATIONS["P5"][:2])
+            self.assertEqual(driver.send_coords_history[-1][2], driver.send_coords_history[0][2])
 
     def test_custom_dest_safety_guard_and_agent_error_propagation(self):
         driver = self._build_mock_driver()

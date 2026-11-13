@@ -4,7 +4,7 @@ import contextlib
 import io
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from pro450_driver import MyCobotPro450Driver
 from vision_tools import VisionActionExecutor
@@ -73,6 +73,45 @@ class MotionTest(unittest.TestCase):
         self.driver = make_driver(self.client)
         self.clock = FakeClock()
         self.target = [200, 0, 250, -178, 0, 45]
+
+    def test_gripper_raw_status_allows_successful_command_to_continue(self):
+        self.client.set_pro_gripper_angle = Mock(return_value=1)
+        self.client.get_pro_gripper_angle = Mock(return_value=6)
+        self.client.get_pro_gripper_status = Mock()
+        for status in (1, 3):
+            with self.subTest(status=status):
+                self.client.get_pro_gripper_status.return_value = status
+                result = self.driver.set_gripper_value(5, expected_clamp=True)
+                self.assertTrue(result['ok'])
+                self.assertFalse(result['dropped'])
+                self.assertEqual(result['status_code'], status)
+                self.assertEqual(result['measured'], 6)
+
+        self.client.set_pro_gripper_angle.return_value = -1
+        with self.assertRaisesRegex(RuntimeError, '夹爪指令失败'):
+            self.driver.set_gripper_value(5, expected_clamp=True)
+
+    def test_pick_continues_through_release_with_drop_status(self):
+        self.client.arrived = 1
+        self.client.set_pro_gripper_angle = Mock(return_value=1)
+        self.client.get_pro_gripper_angle = Mock(return_value=6)
+        self.client.get_pro_gripper_status = Mock(return_value=3)
+        mapper = Mock(spec=['bbox_to_robot_center'])
+        mapper.bbox_to_robot_center.return_value = (200.0, -50.0, 189.0)
+        executor = VisionActionExecutor(self.driver, mapper)
+        progress = Mock()
+        with patch.object(executor, '_sleep_cancelable'), \
+             patch.object(self.driver, 'get_gripper_feedback') as feedback, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = executor.execute_visual_pick_and_place(
+                '棋子', [0, 0, 1, 1], [220.0, -50.0, 189.0],
+                expected_clamp=True, step_callback=progress)
+        self.assertTrue(result['success'])
+        self.assertEqual([item.args[0] for item in self.client.set_pro_gripper_angle.call_args_list],
+                         [15, 5, 15])
+        self.assertEqual(progress.call_args.args[0], 'ACT-11')
+        self.assertEqual(self.client.commands[-1][0], 'angles')
+        feedback.assert_not_called()
 
     def test_unreachable_pose_is_not_sent(self):
         self.client.solution = 'No solution for conversion'

@@ -10,6 +10,12 @@ assert(source.includes('<option value="pick" selected>'));
 
 const mode = { value: 'pick' };
 const output = { innerText: '' };
+const chessElements = {
+  xqHistory: { innerHTML: '' },
+  xqVisionStatus: { innerText: '' },
+  btnXqStart: { style: {} },
+  btnXqStop: { style: {} },
+};
 const calls = [];
 let confirmations = 0;
 let allowPick = false;
@@ -19,7 +25,7 @@ let apiToken = '';
 const context = {
   window: { addEventListener() {} },
   document: {
-    getElementById(id) { return id === 'clickMode' ? mode : output; },
+    getElementById(id) { return id === 'clickMode' ? mode : (chessElements[id] || output); },
     querySelector() { return { getAttribute: () => apiToken }; },
   },
   setInterval() {},
@@ -27,9 +33,16 @@ const context = {
   alert(message) { alertMessage = message; },
   fetch(url, options) {
     calls.push({ url, options });
-    const data = url === '/api/click_pick'
+    let data = url === '/api/click_pick'
       ? { success: false, error: '机械臂正在执行任务' }
       : { success: true, x_mm: 200, y_mm: -30 };
+    if (url === '/api/xiangqi/status') {
+      data = {
+        state: 'MONITOR', turn: 'w', is_running: true,
+        vision: { reason: '源格清空和目标占位已确认' },
+        history: [{ side: 'red', piece_name: '红炮', move: 'b2e2', time: '12:00:00' }],
+      };
+    }
     return Promise.resolve({ json: () => Promise.resolve(data) });
   },
 };
@@ -76,6 +89,12 @@ setImmediate(() => {
   apiToken = 'test-token';
   context.apiFetch('/api/status');
   assert.strictEqual(calls.at(-1).options.headers['X-API-Token'], 'test-token');
-  console.log('抓取确认、定位预览、偏置按钮、裁剪坐标转换及请求认证检查通过');
+  context.updateXiangqiStatus();
+  setImmediate(() => {
+    assert.strictEqual(chessElements.xqVisionStatus.innerText, '源格清空和目标占位已确认');
+    assert(chessElements.xqHistory.innerHTML.includes('红炮'));
+    assert(chessElements.xqHistory.innerHTML.includes('b2e2'));
+    console.log('抓取确认、定位预览、偏置按钮、裁剪坐标、请求认证和走子识别状态检查通过');
+  });
   });
 });

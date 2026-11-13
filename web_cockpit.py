@@ -1163,7 +1163,7 @@ HTML_TEMPLATE = """
                         尚未启动对弈。点击下方【🚀 启动人机对弈闭环】即刻开始！
                     </div>
                     <div style="font-size:0.72rem; color:#64748b; margin-top:6px;">
-                        流程：[1.拍基准图] ➔ [2.OpenCV静止检测人手撤回] ➔ [3.网格差分与规则校验] ➔ [4.Pikafish毫秒决策] ➔ [5.机械臂自动下子/吃子] ➔ 循环
+                        流程：[1.拍无遮挡基准图] ➔ [2.等待画面稳定] ➔ [3.占位、字形与连续帧核验] ➔ [4.Pikafish决策] ➔ [5.机械臂下子/吃子] ➔ 循环
                     </div>
                     <div style="display:flex; gap:8px; margin-top:10px;">
                         <button id="btnXqStart" class="btn-success" style="flex:2;" onclick="startXqGame()">🚀 启动对弈闭环</button>
@@ -1196,6 +1196,7 @@ HTML_TEMPLATE = """
                     <div id="xqHistory" style="max-height:130px; overflow-y:auto; margin-top:4px; background:#0f172a; padding:6px; border-radius:4px;">
                         <div style="color:#64748b; font-size:0.75rem;">暂无走子记录，点击上方启动按钮开始对弈</div>
                     </div>
+                    <div id="xqVisionStatus" style="font-size:0.72rem; color:#94a3b8; margin-top:6px;">等待棋盘基准图</div>
                 </div>
 
                 <!-- 棋盘标定与视觉网格辅助 -->
@@ -1741,6 +1742,8 @@ HTML_TEMPLATE = """
                     if (elFen) elFen.innerText = d.fen;
                     const elLast = document.getElementById('xqLastMove');
                     if (elLast) elLast.innerText = `红: ${d.last_red_move || '--'} | 黑: ${d.last_black_move || '--'}`;
+                    const elVision = document.getElementById('xqVisionStatus');
+                    if (elVision) elVision.innerText = d.vision?.reason || '等待棋盘基准图';
                     const elOffset = document.getElementById('xqOffsetSummary');
                     if (elOffset && d.calib_offset) {
                         const fmt = v => `${Number(v) >= 0 ? '+' : ''}${Number(v).toFixed(1)}`;
@@ -1763,7 +1766,8 @@ HTML_TEMPLATE = """
                         d.history.forEach((h, i) => {
                             const tag = h.side === 'red' ? '<span style="color:#ef4444;">[红方]</span>' : '<span style="color:#38bdf8;">[黑方]</span>';
                             const cap = h.captured ? ` (吃 ${escapeHtml(h.captured)})` : '';
-                            html += `<div style="font-size:0.75rem; padding:3px 0; border-bottom:1px solid #334155;">#${i+1} ${tag} <b>${escapeHtml(h.move)}</b>${cap} <span style="color:#64748b; font-size:0.7rem; float:right;">${escapeHtml(h.time)}</span></div>`;
+                            const piece = h.piece_name ? `${escapeHtml(h.piece_name)} ` : '';
+                            html += `<div style="font-size:0.75rem; padding:3px 0; border-bottom:1px solid #334155;">#${i+1} ${tag} ${piece}<b>${escapeHtml(h.move)}</b>${cap} <span style="color:#64748b; font-size:0.7rem; float:right;">${escapeHtml(h.time)}</span></div>`;
                         });
                         histBox.innerHTML = html || '<div style="color:#64748b; font-size:0.75rem;">暂无走子记录，点击上方启动按钮开始对弈</div>';
                     }
@@ -2287,12 +2291,12 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
         return {"success": True, "intent": "stop"}
 
     pre_parsed = parse_instruction(instruction)
-    if pre_parsed.intent == "reject":
-        add_log(f"🛡️ 指令已安全拦截（{pre_parsed.reject_reason or '否定或禁止指令'}），不触发机械臂运动。")
+    if pre_parsed.intent == "NEGATED":
+        add_log(f"🛡️ 指令已安全拦截（{pre_parsed.reason or '否定或禁止指令'}），不触发机械臂运动。")
         with state_lock:
             telemetry["current_step"] = "已拦截非执行指令"
             telemetry["step_progress"] = 100
-        return {"success": False, "intent": "reject", "reason": pre_parsed.reject_reason}
+        return {"success": False, "intent": "reject", "reason": pre_parsed.reason, "error": pre_parsed.reason}
 
     # 自动解除拖拽示教并复位电机扭矩 (防止关节掉使能报警)
     with state_lock:
@@ -2344,13 +2348,16 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
 
         token.check()
         parsed = parse_instruction(instruction, model_result=cloud_result)
+        needs_scan_and_pick = parsed.intent == "SCAN" and parsed.target is not None and parsed.destination is not None
 
         # 自然语言问答 / 查询意图拦截
-        if parsed.intent in ("chat", "query", "reject"):
+        if parsed.intent == "QUERY" or (
+            parsed.intent == "UNKNOWN" and (cloud_result or {}).get("intent") == "chat"
+        ):
             reply_msg = (
                 (cloud_result or {}).get("reply")
                 or (cloud_result or {}).get("visual_description")
-                or parsed.reject_reason
+                or parsed.reason
                 or "已完成观察/状态确认，无机械臂运动。"
             )
             add_log(f"💬 [具身回复]: {reply_msg}")
@@ -2358,28 +2365,29 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
                 telemetry["current_step"] = "自然语言交互完成"
                 telemetry["step_progress"] = 100
             executor.set_status_led("IDLE")
-            return {"success": True, "intent": parsed.intent, "reply": reply_msg}
+            return {"success": True, "intent": "query" if parsed.intent == "QUERY" else "chat", "reply": reply_msg}
 
-        # 复位待机
-        if parsed.intent == "reset":
-            add_log("🏠 收到复位指令，机械臂平稳返回待机姿态 NORMAL...")
+        # 工位移动与复位
+        if parsed.intent == "MOVE_TO_STATION":
+            station = parsed.destination or "NORMAL"
+            add_log(f"🏠 机械臂正在前往工位 {station}...")
             with state_lock:
-                telemetry["current_step"] = "正在复位至 NORMAL..."
+                telemetry["current_step"] = f"正在前往工位 {station}..."
                 telemetry["step_progress"] = 50
             executor.set_status_led("MOVING")
-            res = executor.move_to_station("NORMAL")
+            res = executor.move_to_station(station, cancel_token=token)
             ok = bool(res.get("success", True))
             with state_lock:
-                telemetry["current_step"] = "机械臂已安全到达初始待机位" if ok else f"复位失败: {res.get('error', '')}"
+                telemetry["current_step"] = f"机械臂已到达工位 {station}" if ok else f"移动失败: {res.get('error', '')}"
                 telemetry["step_progress"] = 100
             executor.set_status_led("IDLE" if ok else "ERROR")
-            add_log("✅ 机械臂已安全到达初始待机工位 NORMAL" if ok else f"❌ 复位失败: {res.get('error', '')}")
+            add_log(f"✅ 机械臂已到达工位 {station}" if ok else f"❌ 移动失败: {res.get('error', '')}")
             refresh_pose()
-            return {"success": ok, "intent": "reset"}
+            return {"success": ok, "intent": "move_to_station"}
 
         # 夹爪控制
-        if parsed.intent in ("gripper_open", "gripper_close"):
-            act_str = "OPEN" if parsed.intent == "gripper_open" else "CLOSE"
+        if parsed.intent in ("GRIPPER_OPEN", "GRIPPER_CLOSE"):
+            act_str = "OPEN" if parsed.intent == "GRIPPER_OPEN" else "CLOSE"
             res = executor.control_gripper(act_str)
             ok = bool(res.get("success", True))
             label = "夹爪张开 (15%)" if act_str == "OPEN" else "夹爪收紧 (5%)"
@@ -2388,10 +2396,10 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
                 telemetry["current_step"] = label if ok else f"{label}失败"
                 telemetry["step_progress"] = 100
             refresh_pose()
-            return {"success": ok, "intent": parsed.intent}
+            return {"success": ok, "intent": parsed.intent.lower()}
 
         # 挥手打招呼
-        if parsed.intent == "wave":
+        if parsed.intent == "WAVE":
             executor.set_status_led("MOVING")
             with state_lock:
                 telemetry["current_step"] = "正在执行挥手动作..."
@@ -2414,7 +2422,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
             return {"success": True, "intent": "wave"}
 
         # 纯巡检扫描
-        if parsed.intent == "scan" and not parsed.needs_scan_and_pick:
+        if parsed.intent == "SCAN" and not needs_scan_and_pick:
             add_log("🚀 启动工作台全景三维巡检扫描...")
             def scan_cb(code, desc, pct=50):
                 with state_lock:
@@ -2448,7 +2456,7 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
             return {"success": True, "intent": "scan", "count": len(all_objs)}
 
         # 搬运任务：拒绝在未指定有效目的地时静默回退到 P5
-        final_dest = parsed.custom_dest_coord or parsed.destination
+        final_dest = parsed.destination
         if final_dest is None:
             msg = "未指定明确目标工位（如 P1~P5 / 左右工作区），为确保安全不执行默认工位搬运"
             add_log(f"⚠️ {msg}")
@@ -2465,18 +2473,21 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
         else:
             dest_desc = f"工位【{final_dest}】"
 
-        target_obj = parsed.target_object or "工件"
-        is_batch = bool(parsed.is_batch)
-        max_loops = int(parsed.max_count) if parsed.max_count else 1
+        target_obj = parsed.target or "工件"
+        is_batch = parsed.batch_all or (parsed.count is not None and parsed.count > 1)
+        max_loops = parsed.count
+        if max_loops is None and not parsed.batch_all:
+            max_loops = 1
+        count_label = str(max_loops) if max_loops is not None else "全部"
         motion_speed = int(parsed.speed) if parsed.speed else int(telemetry.get("motion_speed", 20))
         motion_speed = max(5, min(80, motion_speed))
 
         add_log(
             f"🧠 具身任务规划: [目标=【{target_obj}】] -> [目的地={dest_desc}] -> "
-            f"[速度={motion_speed}%] -> [批量={is_batch} (上限 {max_loops})]"
+            f"[速度={motion_speed}%] -> [批量={is_batch} (数量 {count_label})]"
         )
 
-        if parsed.needs_scan_and_pick:
+        if needs_scan_and_pick:
             add_log("🚀 [工序 1/2]: 启动工作台多视点全景扫描巡检...")
             def scan_cb(code, desc, pct=50):
                 with state_lock:
@@ -2505,7 +2516,8 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
         success_count = 0
         attempted_centers: List[Tuple[float, float]] = []
 
-        for loop_idx in range(max_loops):
+        loop_idx = 0
+        while max_loops is None or loop_idx < max_loops:
             token.check()
             fresh_frame = cam.get_latest_frame()
             if fresh_frame is None:
@@ -2513,17 +2525,24 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
                 fresh_frame = cam.get_latest_frame()
 
             if is_batch:
-                add_log(f"🔍 [循环扫描 {loop_idx+1}/{max_loops}]: 正在检测工作台上的【{target_obj}】...")
+                add_log(f"🔍 [循环扫描 {loop_idx+1}/{count_label}]: 正在检测工作台上的【{target_obj}】...")
                 with state_lock:
-                    telemetry["current_step"] = f"循环识别第 {loop_idx+1}/{max_loops} 批工件..."
-                    telemetry["step_progress"] = int((loop_idx / max(1, max_loops)) * 100)
+                    telemetry["current_step"] = f"循环识别第 {loop_idx+1}/{count_label} 批工件..."
+                    telemetry["step_progress"] = int(loop_idx / max_loops * 100) if max_loops else 0
 
-            all_objs = detect_all_table_objects(fresh_frame, mapper=mapper) if fresh_frame is not None else []
+            if (
+                fresh_frame is not None and loop_idx == 0
+                and parsed.model_bbox is not None and not needs_scan_and_pick
+            ):
+                all_objs = [{"name": target_obj, "bbox": parsed.model_bbox}]
+            else:
+                all_objs = detect_all_table_objects(fresh_frame, mapper=mapper) if fresh_frame is not None else []
             matching_objs = []
             for o in all_objs:
-                obbox = o.get("bbox")
-                if not validate_bbox(obbox):
+                obbox, bbox_error = validate_bbox(o.get("bbox"))
+                if obbox is None or bbox_error:
                     continue
+                o = {**o, "bbox": obbox}
                 ocx = (float(obbox[1]) + float(obbox[3])) / 2.0
                 ocy = (float(obbox[0]) + float(obbox[2])) / 2.0
                 if any(math.hypot(ocx - ax, ocy - ay) < 45.0 for ax, ay in attempted_centers):
@@ -2599,13 +2618,14 @@ def execute_embodied_instruction(instruction: str, cancel_token: Optional[Cancel
 
             if res.get("success"):
                 success_count += 1
-                add_log(f"🎉 成功移送【{item_name}】至 {dest_desc}！(累计: {success_count}/{max_loops})")
+                add_log(f"🎉 成功移送【{item_name}】至 {dest_desc}！(累计: {success_count}/{count_label})")
             else:
                 add_log(f"⚠️ 搬运【{item_name}】受阻: {res.get('error')}")
                 if not is_batch:
                     break
 
             token.wait(0.6)
+            loop_idx += 1
 
         with state_lock:
             if success_count > 0:
@@ -2795,7 +2815,7 @@ def api_click_pick():
                 telemetry["current_step"] = f"{step_id}: {desc}"
                 telemetry["step_progress"] = pct
 
-        def async_click_worker(token=None):
+        def async_click_worker(token=None, _record=None):
             try:
                 curr_speed = telemetry.get("motion_speed", 20)
                 try:
@@ -2842,7 +2862,7 @@ def api_click_pick():
                 refresh_pose()
 
         if tm is not None:
-            tm.try_start("click_pick", async_click_worker, meta={"target_station": station})
+            tm.try_start("click_pick", async_click_worker, description=f"点击抓取至 {station}")
         else:
             threading.Thread(target=async_click_worker, daemon=True).start()
         return jsonify({"success": True})
@@ -2958,6 +2978,7 @@ def api_manual():
 def api_xiangqi_status():
     ox, oy, oz = get_calib_offset()
     with xiangqi_agent.lock:
+        vision = getattr(xiangqi_agent, 'last_detection_info', {})
         return jsonify({
             "is_running": xiangqi_agent.is_running,
             "state": xiangqi_agent.current_state,
@@ -2972,6 +2993,7 @@ def api_xiangqi_status():
             "calib_offset": {"x": ox, "y": oy, "z": oz},
             "fault_info": getattr(xiangqi_agent, "fault_info", None),
             "game_id": getattr(xiangqi_agent, "game_id", 0),
+            "vision": vision if isinstance(vision, dict) else {},
         })
 
 @app.route('/api/xiangqi/start', methods=['POST'])
@@ -3014,8 +3036,9 @@ def api_xiangqi_endgame_detect():
     try:
         from xiangqi_endgame import detect_endgame_from_image
 
-        def _move_home(tok):
-            res = executor.move_to_station("HOME")
+        def _move_home(tok, _record):
+            tok.check()
+            res = executor.move_to_station("HOME", cancel_token=tok)
             if not res.get("success", True):
                 raise RuntimeError(res.get("error", "归位失败"))
             return res

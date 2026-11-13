@@ -25,7 +25,7 @@ _STOP_RE = re.compile(
 )
 
 _NEGATED_MOTION_RE = re.compile(
-    r"(不要|别|禁止|切勿|不能|不可|取消)\s*(?:去|再|继续|把.*?)?"
+    r"(不要|(?<![识分])别|禁止|切勿|不能|不可|取消)\s*(?:去|再|继续|把.*?)?"
     r"(抓|夹|拿|取|搬|移动|移|放|碰|点动|运行|执行|靠近|去)",
     re.IGNORECASE,
 )
@@ -282,6 +282,16 @@ def parse_instruction(text: str, model_result: Optional[Dict[str, Any]] = None) 
     explicit_speed = extract_speed(raw)
     explicit_count, explicit_batch_all = extract_count_and_batch(raw)
     explicit_target = _extract_target_phrase(raw)
+    transfer = re.search(
+        r"(?:把|将|识别|检测|定位|找到|寻找)\s*(.+?)\s*"
+        r"(?:[，,]\s*)?(?:并且|并|然后|再)?\s*" + _DEST_TRIGGER_RE.pattern,
+        raw,
+    )
+    robot_target = transfer and re.fullmatch(
+        r"(?:机械臂|机器人|手臂|夹爪|末端(?:执行器)?)"
+        r"(?:\s*(?:慢慢|缓慢|平稳|直接|安全|匀速|慢速|快速)(?:地)?)?",
+        transfer.group(1).strip(),
+    )
 
     # 基础动作规则判别
     if re.search(r"(全景扫描|环视扫描|扫描工作台|扫描桌面|查看桌面)", raw):
@@ -294,6 +304,9 @@ def parse_instruction(text: str, model_result: Optional[Dict[str, Any]] = None) 
         base_intent = "MOVE_TO_STATION"
         if not explicit_dest:
             explicit_dest = "NORMAL"
+    elif explicit_dest and transfer:
+        # 物品搬运句式优先于工位号兜底，机械臂本体移动按工位动作执行。
+        base_intent = "MOVE_TO_STATION" if robot_target else "PICK_AND_PLACE"
     elif re.search(r"(去|前往|移动到|移至|回到)\s*(?:工位|[一二三四五]号工位|P[1-5]|NORMAL|HOME|SCAN)", raw, re.IGNORECASE) and not re.search(r"(抓|夹|拿|搬|棋子|方块|物体|积木)", raw):
         base_intent = "MOVE_TO_STATION"
         if not explicit_dest:
@@ -320,6 +333,14 @@ def parse_instruction(text: str, model_result: Optional[Dict[str, Any]] = None) 
     reason = ""
 
     if isinstance(model_result, dict):
+        arguments = model_result.get("arguments")
+        if isinstance(arguments, dict):
+            model_result = {
+                **model_result,
+                "target": arguments.get("target_object", model_result.get("target")),
+                "destination": arguments.get("target_station", model_result.get("destination")),
+                "bbox": arguments.get("normalized_bbox", model_result.get("bbox")),
+            }
         # 1. 目标裁决
         m_target = model_result.get("target") or model_result.get("object")
         if m_target and isinstance(m_target, str):

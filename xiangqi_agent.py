@@ -3,8 +3,8 @@
 中国象棋具身智能自主对弈中枢 (Embodied Xiangqi Autonomous Playing Agent)
 严格遵循 5 步闭环对弈流水线：
 1. [拍基准图]: 机械臂停在不遮挡视野的待机位 (NORMAL/HOME)，截取当前干净棋盘基准图 base_frame
-2. [轻量监控]: OpenCV 零算力差分轮询 (条件A: 帧间静止持续 1~1.5 秒确认人手缩回; 条件B: 棋盘相对 base_frame 产生显著位移)
-3. [Qwen3-VL 识别 + 规则裁判]: 提取变动网格，校验是否为合法的红方着法（非法国度直接忽略继续等待）
+2. [轻量监控]: 画面稳定后逐格检查占位变化，等待人手撤离与棋子落稳
+3. [棋子追踪 + 规则裁判]: 核验源格清空、目标占位与字形外观，连续帧一致后提交合法红方着法
 4. [Pikafish 决策]: 0.5 秒内获取高智力黑方最佳应对着法
 5. [机械臂物理执行]: 吃子自动拾取丢入弃子盒，落子平稳转移，动作完毕复位待机并触发下一步基准采样
 """
@@ -21,11 +21,13 @@ import cv2
 from typing import Dict, Any, List, Tuple, Optional, Callable
 
 from json_store import read_json, atomic_write_json
-from xiangqi_engine import XiangqiBoard, PikafishEngine, square_to_coord, coord_to_square, INITIAL_FEN
+from xiangqi_engine import XiangqiBoard, PikafishEngine, square_to_coord, coord_to_square, INITIAL_FEN, PIECE_NAMES_CN
+from xiangqi_vision import XiangqiMoveDetector, MoveConfirmation
 from vision_calibration import HandEyeMapper
 from vision_tools import VisionActionExecutor, PRESET_JOINTS, PRESET_STATIONS
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xiangqi_board_config.json")
+CHESS_GRIPPER_OPEN_PERCENT = 17
 
 # 默认象棋棋盘在相机画面中的 4 个角点像素坐标 (a0: 红左下, i0: 红右下, i9: 黑右上, a9: 黑左上)
 # 对应归一化坐标 0~1000
@@ -239,8 +241,15 @@ class XiangqiAgent:
         self.stable_duration: float = 0.0
         self.last_check_time: float = time.time()
         self.last_detection_info: Dict[str, Any] = {}
+        self.move_detector = XiangqiMoveDetector()
+        self.move_confirmation = MoveConfirmation()
+        self._camera_sample_key = None
+        self._baseline_home_ready = False
+        self._baseline_ignored_squares = ()
+        self._turn_snapshot = None
+        self._illegal_move = None
 
-        # 对弈信息记录 (IDLE, WAIT_BASE, MONITOR, VERIFY, PIKAFISH, ARM_MOVE, FAULT)
+        # 对弈信息记录 (IDLE, WAIT_BASE, MONITOR, VERIFY, VERIFY_POSITION, WAIT_UNDO, PIKAFISH, ARM_MOVE, FAULT)
         self.current_state = "IDLE"
         self.status_text = "待机中"
         self.last_error: Optional[str] = None
@@ -278,8 +287,15 @@ class XiangqiAgent:
             self.last_error = None
             self.fault_info = None
             self.base_frame = None
+            self._baseline_ignored_squares = ()
+            self._turn_snapshot = None
+            self._illegal_move = None
             self.prev_frame = None
             self.stable_duration = 0.0
+            self.last_detection_info = {}
+            self.move_detector.reset()
+            self.move_confirmation.reset()
+            self._baseline_home_ready = False
             self._stop_event.clear()
             self.is_running = True
             self.current_state = "WAIT_BASE"
@@ -324,7 +340,14 @@ class XiangqiAgent:
                 self.status_text = "故障已清除，当前待机"
                 return
             self._stop_event.clear()
+            self.move_detector.reset()
+            self.move_confirmation.reset()
+            self._baseline_home_ready = False
             self.is_running = True
+            self.base_frame = None
+            self._baseline_ignored_squares = ()
+            self._turn_snapshot = None
+            self._illegal_move = None
             self.current_state = "WAIT_BASE"
             self.status_text = "故障已清除，正在重拍基准图确认物理棋盘..."
             gid = self.game_id
@@ -375,7 +398,7 @@ class XiangqiAgent:
     def _execute_arm_move_phases(self, expected_game_id: int, expected_board_ver: int):
         """
         分段物理执行黑方走子：
-        Phase 1 (capture_discard): 若目标格有红子，先抓入弃子盒 P4 并记录 capture_cleared；
+        Phase 1 (capture_discard): 若目标格有红子，先抓入弃子盒 P5 并记录 capture_cleared；
         Phase 2 (piece_move): 搬运黑子 from -> to；
         Phase 3 (commit_board): 核对 game_id/board_version 一致后提交走子到棋盘状态。
         """
@@ -393,8 +416,8 @@ class XiangqiAgent:
         with self._motion_ctx("xiangqi_move", f"象棋执黑走子 {b_from}->{b_to}") as cancel_token:
             try:
                 if needs_capture:
-                    self.status_text = f"阶段1/2 [吃子清理]: 移除目标格 {b_to} 红方棋子至 P4..."
-                    self._physical_pick_and_place_square(b_to, dest_station="P4", cancel_token=cancel_token)
+                    self.status_text = f"阶段1/2 [吃子清理]: 移除目标格 {b_to} 红方棋子至 P5..."
+                    self._physical_pick_and_place_square(b_to, dest_station="P5", cancel_token=cancel_token)
                     capture_cleared = True
                     if not self._sleep_cancelable(0.3):
                         raise RuntimeError("对弈已停止")
@@ -414,6 +437,11 @@ class XiangqiAgent:
             if not ok:
                 raise RuntimeError(f"执行后状态提交失败: {std_move} 不再合法")
             self.board_version += 1
+            self._baseline_ignored_squares = (b_from, b_to)
+            self._turn_snapshot = {
+                "fen": self.board.get_fen(), "frame": None,
+                "rotated": self.is_rotated, "board_version": self.board_version,
+            }
             self.move_history.append({
                 "side": "black",
                 "move": phys_move,
@@ -430,33 +458,106 @@ class XiangqiAgent:
             try:
                 state = self.current_state
                 if state == "WAIT_BASE":
-                    self.status_text = "正在平稳复位至待机位 (NORMAL)，拍摄无遮挡基准图..."
-                    try:
-                        with self._motion_ctx("xiangqi_reset", "象棋对弈复位拍基准图") as cancel_token:
-                            kwargs = {"speed": 25}
-                            if cancel_token is not None:
-                                kwargs["cancel_token"] = cancel_token
-                            self.driver.send_angles(PRESET_JOINTS["NORMAL"], **kwargs)
-                    except Exception as e:
-                        self._enter_fault("WAIT_BASE", e)
-                        break
-
-                    if not self._sleep_cancelable(1.0):
-                        break
+                    if self._turn_snapshot is None or self._turn_snapshot["board_version"] != self.board_version:
+                        self._turn_snapshot = {
+                            "fen": self.board.get_fen(), "frame": None,
+                            "rotated": self.is_rotated, "board_version": self.board_version,
+                        }
+                    if not self._baseline_home_ready:
+                        self.status_text = "正在平稳复位至待机位 (NORMAL)，拍摄无遮挡基准图..."
+                        try:
+                            with self._motion_ctx("xiangqi_reset", "象棋对弈复位拍基准图") as cancel_token:
+                                kwargs = {"speed": 25}
+                                if cancel_token is not None:
+                                    kwargs["cancel_token"] = cancel_token
+                                self.driver.send_angles(PRESET_JOINTS["NORMAL"], **kwargs)
+                        except Exception as e:
+                            self._enter_fault("WAIT_BASE", e)
+                            break
+                        self._baseline_home_ready = True
+                        if not self._sleep_cancelable(0.3):
+                            break
 
                     frame = self._get_fresh_camera_frame()
                     if frame is not None:
+                        candidate_base = frame.copy()
+                        report = self.move_detector.prepare_base(
+                            candidate_base, self.board, self.grid_mapper, self.is_rotated
+                        )
+                        self.last_detection_info = report
+                        if not report['ready']:
+                            move, info = self.move_detector.detect_from_position(
+                                candidate_base, self.board, self.grid_mapper, self.is_rotated,
+                            )
+                            if move or info.get("illegal_move"):
+                                self.last_detection_info = info
+                                self.move_confirmation.reset()
+                                self.current_state = "VERIFY_POSITION"
+                                self.status_text = "当前占位已匹配红方着法，正在连续帧确认吃子局面..."
+                                continue
+                            if self.base_frame is not None and self._baseline_ignored_squares and report['missing_red_squares']:
+                                move, info = self.move_detector.detect(
+                                    self.base_frame, candidate_base, self.board, self.grid_mapper,
+                                    self.is_rotated, self._baseline_ignored_squares,
+                                )
+                                if move or info.get("illegal_move"):
+                                    self.last_detection_info = info
+                                    self.prev_frame = frame.copy()
+                                    self.move_confirmation.reset()
+                                    self.current_state = "VERIFY"
+                                    self.status_text = "检测到基准图采集期间的红方走子，正在连续帧确认..."
+                                    continue
+                            self.status_text = report['reason']
+                            self._sleep_cancelable(0.4)
+                            continue
                         with self.lock:
                             if self.game_id != loop_game_id or not self.is_running:
                                 break
-                            self.base_frame = frame.copy()
+                            self.base_frame = candidate_base
+                            self._turn_snapshot["frame"] = candidate_base
+                            self._baseline_ignored_squares = ()
                             self.prev_frame = frame.copy()
                             self.stable_duration = 0.0
                             self.last_check_time = time.time()
+                            self.move_confirmation.reset()
                             self.current_state = "MONITOR"
-                            self.status_text = "基准图采集完毕！等待人类走红棋 (OpenCV 零算力监测人手)..."
+                            self.status_text = "基准图采集完毕，等待红方走棋并核验棋子离位与落位..."
                     else:
                         self._sleep_cancelable(0.4)
+                    continue
+
+                elif state == "WAIT_UNDO":
+                    frame = self._get_fresh_camera_frame()
+                    if frame is None:
+                        self._sleep_cancelable(0.2)
+                        continue
+                    snapshot = self._turn_snapshot
+                    restored, info = self.move_detector.matches_snapshot(
+                        snapshot["frame"], frame, XiangqiBoard(snapshot["fen"]), self.grid_mapper,
+                        snapshot["rotated"], self._illegal_move.get("illegal_squares", ()),
+                    )
+                    self.last_detection_info = dict(info, undo_required=True, illegal_move=self._illegal_move["illegal_move"])
+                    confirmed = self.move_confirmation.observe(
+                        ("undo", snapshot["fen"]) if restored else None, self._camera_sample_key,
+                    )
+                    self.status_text = f"走子错误，请恢复上一回合棋局。{info['reason']}"
+                    if confirmed:
+                        with self.lock:
+                            if self.game_id != loop_game_id or self.board_version != snapshot["board_version"] or not self.is_running:
+                                break
+                            self.base_frame = frame.copy()
+                            self.prev_frame = frame.copy()
+                            snapshot["frame"] = self.base_frame
+                            self._baseline_ignored_squares = ()
+                            self._illegal_move = None
+                            self.move_detector.reset()
+                            self.move_confirmation.reset()
+                            self.stable_duration = 0.0
+                            self.last_check_time = time.time()
+                            self.current_state = "MONITOR"
+                            self.last_detection_info.update(undo_required=False)
+                            self.status_text = "已恢复上一回合棋局，请重新走棋"
+                    self._sleep_cancelable(0.2)
                     continue
 
                 elif state == "MONITOR":
@@ -476,7 +577,6 @@ class XiangqiAgent:
                         continue
                     roi_curr = curr_frame[by1:by2, bx1:bx2]
                     roi_prev = self.prev_frame[by1:by2, bx1:bx2]
-                    roi_base = self.base_frame[by1:by2, bx1:bx2]
 
                     frame_diff = cv2.absdiff(roi_curr, roi_prev)
                     motion_score = float(np.mean(frame_diff))
@@ -486,38 +586,63 @@ class XiangqiAgent:
                     else:
                         self.stable_duration = 0.0
 
-                    # 光照归一化后再评估棋盘变动，降低环境光漂移触发假阳性
-                    gray_c = cv2.cvtColor(roi_curr, cv2.COLOR_BGR2GRAY).astype(np.float32)
-                    gray_b = cv2.cvtColor(roi_base, cv2.COLOR_BGR2GRAY).astype(np.float32)
-                    gray_c_norm = gray_c - (float(np.mean(gray_c)) - float(np.mean(gray_b)))
-                    board_changed_score = float(np.mean(np.abs(gray_c_norm - gray_b)))
-
                     self.prev_frame = curr_frame.copy()
 
-                    if self.stable_duration >= 1.2 and board_changed_score > 4.5:
+                    if self.stable_duration >= 1.2:
                         self.current_state = "VERIFY"
-                        self.status_text = "检测到棋盘走子完成！正在进行网格差分与象棋规则审查..."
+                        self.status_text = "画面已稳定，正在核验各格棋子离位和落位..."
                     else:
                         self._sleep_cancelable(0.15)
                     continue
 
-                elif state == "VERIFY":
+                elif state in ("VERIFY", "VERIFY_POSITION"):
                     curr_frame = self._get_fresh_camera_frame()
-                    if curr_frame is None or self.base_frame is None:
+                    if curr_frame is None or (state == "VERIFY" and self.base_frame is None):
+                        self.move_confirmation.reset()
                         self._sleep_cancelable(0.4)
                         continue
 
-                    detected_move = self._detect_moved_square_pair(self.base_frame, curr_frame)
+                    reference = None if state == "VERIFY_POSITION" else self.base_frame
+                    detected_move = self._detect_moved_square_pair(reference, curr_frame)
                     if not detected_move:
+                        illegal = self.last_detection_info.get("illegal_move")
+                        if illegal:
+                            confirmed = self.move_confirmation.observe(("illegal", illegal), self._camera_sample_key)
+                            self.status_text = f"正在核实走子错误 [{illegal}]，连续帧确认 {self.move_confirmation.count}/3..."
+                            if confirmed:
+                                if self._turn_snapshot is None:
+                                    snapshot_frame = self.base_frame if state == "VERIFY" and not self._baseline_ignored_squares else None
+                                    self._turn_snapshot = {
+                                        "fen": self.board.get_fen(), "frame": snapshot_frame,
+                                        "rotated": self.is_rotated, "board_version": self.board_version,
+                                    }
+                                self._illegal_move = dict(self.last_detection_info)
+                                self.move_confirmation.reset()
+                                self.current_state = "WAIT_UNDO"
+                                self.status_text = self.last_detection_info["reason"]
+                            self._sleep_cancelable(0.2)
+                            continue
+                        self.move_confirmation.reset()
                         reason = self.last_detection_info.get("reason", "未锁定高置信度着法")
                         self.status_text = f"棋盘判定待确认 ({reason})，继续监控..."
-                        self.current_state = "MONITOR"
-                        self.stable_duration = 0.0
-                        self._sleep_cancelable(0.4)
+                        self.current_state = "WAIT_BASE" if state == "VERIFY_POSITION" else "MONITOR"
+                        self._sleep_cancelable(0.15)
                         continue
 
                     from_sq, to_sq = detected_move
                     candidate_uci = f"{from_sq}{to_sq}"
+                    confirmed = self.move_confirmation.observe(detected_move, self._camera_sample_key)
+                    self.last_detection_info['confirmation_frames'] = self.move_confirmation.count
+                    self.last_detection_info['required_frames'] = self.move_confirmation.required_frames
+                    self.last_detection_info['confirmed'] = confirmed
+                    piece_name = PIECE_NAMES_CN.get(self.last_detection_info.get('piece'), '棋子')
+                    if not confirmed:
+                        self.status_text = (
+                            f"候选{piece_name} {candidate_uci}，连续帧核验 "
+                            f"{self.move_confirmation.count}/{self.move_confirmation.required_frames}..."
+                        )
+                        self._sleep_cancelable(0.2)
+                        continue
                     if self.is_rotated:
                         from xiangqi_endgame import rotate_square_180
                         std_uci = f"{rotate_square_180(from_sq)}{rotate_square_180(to_sq)}"
@@ -532,21 +657,26 @@ class XiangqiAgent:
                             self.current_state = "MONITOR"
                             self.stable_duration = 0.0
                             continue
+                        moving_piece = self.board.get_piece(std_uci[:2])
                         ok, captured_symbol = self.board.apply_move(std_uci)
                         if not ok:
                             self.current_state = "MONITOR"
                             continue
                         self.board_version += 1
+                        self.base_frame = curr_frame.copy()
+                        self._baseline_ignored_squares = ()
                         self.last_red_move = candidate_uci
                         self.move_history.append({
                             "side": "red",
+                            "piece": moving_piece,
+                            "piece_name": PIECE_NAMES_CN[moving_piece],
                             "move": candidate_uci,
                             "std_move": std_uci,
                             "captured": captured_symbol,
                             "fen": self.board.get_fen(),
                             "time": time.strftime("%H:%M:%S")
                         })
-                        self.status_text = f"红方走棋确认: {candidate_uci}，正在呼叫 Pikafish 引擎思考对策..."
+                        self.status_text = f"确认{PIECE_NAMES_CN[moving_piece]} {candidate_uci}，正在呼叫 Pikafish 引擎思考对策..."
                         self.current_state = "PIKAFISH"
                     continue
 
@@ -589,6 +719,8 @@ class XiangqiAgent:
 
                     self.status_text = f"黑方落子完成 ({self.last_black_move})，机械臂复位待机，等待红方..."
                     self.current_state = "WAIT_BASE"
+                    self._baseline_home_ready = False
+                    self.move_confirmation.reset()
                     self._sleep_cancelable(0.8)
                     continue
 
@@ -601,6 +733,7 @@ class XiangqiAgent:
 
     def _get_fresh_camera_frame(self) -> Optional[np.ndarray]:
         """优先通过进程内 frame_provider 零拷贝取帧，未注入时回退 HTTP 拉帧。"""
+        self._camera_sample_key = ('sample', time.monotonic_ns())
         if callable(self.frame_provider):
             try:
                 res = self.frame_provider()
@@ -608,6 +741,10 @@ class XiangqiAgent:
                     frame, meta = res
                     if meta and not meta.get("fresh", True):
                         return None
+                    if meta and meta.get('frame_id') is not None:
+                        self._camera_sample_key = ('camera', meta['frame_id'])
+                    elif meta and meta.get('timestamp') is not None:
+                        self._camera_sample_key = ('capture', meta['timestamp'])
                     return frame
                 return res
             except Exception:
@@ -623,162 +760,22 @@ class XiangqiAgent:
         return None
 
     def _detect_moved_square_pair(self, base_img: np.ndarray, curr_img: np.ndarray) -> Optional[Tuple[str, str]]:
-        """
-        高精度着法判决：
-        1. 全局亮度归一化 + 分辨率自适应邻域半径；
-        2. 遮挡与大范围位移拦截：>35% 格点显著变化时判定人手/相机晃动遮挡并拒绝；
-        3. 联合差分、边缘纹理 (Sobel) 消失/出现趋势、木质色度以及 top1-top2 置信间隔判决。
-        """
-        if base_img is None or curr_img is None or base_img.shape[:2] != curr_img.shape[:2]:
-            self.last_detection_info = {"reason": "基准帧与当前帧尺寸不一致"}
-            return None
-
-        h, w = curr_img.shape[:2]
-        gray_base = cv2.cvtColor(base_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-        gray_curr = cv2.cvtColor(curr_img, cv2.COLOR_BGR2GRAY).astype(np.float32)
-
-        # 全局亮度均值与对比度偏移校正
-        bx1, by1, bx2, by2 = self.grid_mapper.get_board_bounding_rect_px(w, h)
-        roi_b = gray_base[by1:by2, bx1:bx2]
-        roi_c = gray_curr[by1:by2, bx1:bx2]
-        if roi_b.size > 0 and roi_c.size > 0:
-            shift = float(np.mean(roi_c) - np.mean(roi_b))
-            gray_curr_norm = np.clip(gray_curr - shift, 0.0, 255.0)
+        """先核实棋子离位与落位，再根据当前棋局校验着法。"""
+        with self.lock:
+            board = XiangqiBoard(self.board.get_fen())
+            rotated = self.is_rotated
+            version = self.board_version
+        if base_img is None:
+            move, info = self.move_detector.detect_from_position(curr_img, board, self.grid_mapper, rotated)
         else:
-            gray_curr_norm = gray_curr
-
-        diff = np.abs(gray_base - gray_curr_norm)
-        grad_base = np.abs(cv2.Sobel(gray_base, cv2.CV_32F, 1, 0, ksize=3)) + np.abs(
-            cv2.Sobel(gray_base, cv2.CV_32F, 0, 1, ksize=3)
-        )
-        grad_curr = np.abs(cv2.Sobel(gray_curr_norm, cv2.CV_32F, 1, 0, ksize=3)) + np.abs(
-            cv2.Sobel(gray_curr_norm, cv2.CV_32F, 0, 1, ksize=3)
-        )
-
-        # 分辨率缩放后的网格半径（约格距的 28%，限制在 [8, 36]）
-        board_span = max(80.0, min(float(max(1, bx2 - bx1)), float(max(1, by2 - by1))))
-        rad = max(8, min(36, int(round(board_span / 8.0 * 0.28))))
-
-        sq_diffs: Dict[str, float] = {}
-        sq_grad_base: Dict[str, float] = {}
-        sq_grad_curr: Dict[str, float] = {}
-        sq_wood_base: Dict[str, float] = {}
-        sq_wood_curr: Dict[str, float] = {}
-
-        for r in range(10):
-            for c in range(9):
-                sq = coord_to_square(c, r)
-                px, py = self.grid_mapper.get_square_pixel_pos(sq, w, h)
-                y1, y2 = max(0, py - rad), min(h, py + rad)
-                x1, x2 = max(0, px - rad), min(w, px + rad)
-                if y2 <= y1 or x2 <= x1:
-                    sq_diffs[sq] = 0.0
-                    sq_grad_base[sq] = 0.0
-                    sq_grad_curr[sq] = 0.0
-                    sq_wood_base[sq] = 0.0
-                    sq_wood_curr[sq] = 0.0
-                    continue
-
-                patch_diff = diff[y1:y2, x1:x2]
-                pb_g = grad_base[y1:y2, x1:x2]
-                pc_g = grad_curr[y1:y2, x1:x2]
-                pb_bgr = base_img[y1:y2, x1:x2].astype(np.float32)
-                pc_bgr = curr_img[y1:y2, x1:x2].astype(np.float32)
-
-                sq_diffs[sq] = float(np.mean(patch_diff))
-                sq_grad_base[sq] = float(np.mean(pb_g))
-                sq_grad_curr[sq] = float(np.mean(pc_g))
-                sq_wood_base[sq] = float(np.mean(pb_bgr[:, :, 2] - pb_bgr[:, :, 0]))
-                sq_wood_curr[sq] = float(np.mean(pc_bgr[:, :, 2] - pc_bgr[:, :, 0]))
-
-        # 大面积遮挡/全局位移拒识：若超过 35% 的格点发生显著变化，说明有遮挡或相机晃动
-        changed_squares = [sq for sq, d in sq_diffs.items() if d >= 12.0]
-        if len(changed_squares) > 32:
-            self.last_detection_info = {
-                "changed_count": len(changed_squares),
-                "reason": f"检测到大面积异常变动 ({len(changed_squares)}/90 格)，疑为人手遮挡或全局光照/视角偏移",
-            }
-            return None
-
-        legal_moves = self.board.generate_legal_moves("w")
-        if not legal_moves:
-            self.last_detection_info = {"reason": "当前局面无可走合法红方着法"}
-            return None
-
-        candidates: List[Tuple[float, str, str, float, float]] = []
-        for m in legal_moves:
-            if self.is_rotated:
-                from xiangqi_endgame import rotate_square_180
-                f_sq = rotate_square_180(m[:2])
-                t_sq = rotate_square_180(m[2:])
-            else:
-                f_sq = m[:2]
-                t_sq = m[2:]
-
-            d_from = sq_diffs.get(f_sq, 0.0)
-            d_to = sq_diffs.get(t_sq, 0.0)
-            if d_from < 8.0 or d_to < 8.0:
-                continue
-
-            # 占用趋势：起点纹理/木色减弱 (离开)，终点变化且保留/新增棋子纹理或吃子变化
-            vacate_gain = max(0.0, (sq_grad_base[f_sq] - sq_grad_curr[f_sq]) * 0.15)
-            vacate_wood = max(0.0, (sq_wood_base[f_sq] - sq_wood_curr[f_sq]) * 0.25)
-            dest_gain = max(0.0, (sq_grad_curr[t_sq] - sq_grad_base[t_sq]) * 0.12)
-            # 吃子场景下终点可能从红/黑子变为另一子，d_to 依然很大且终点边缘保持较高能量
-            end_presence_bonus = 3.0 if sq_grad_curr[t_sq] >= max(6.0, sq_grad_base[f_sq] * 0.35) else 0.0
-
-            # 惩罚在起点和终点之外存在明显更大不明异动的情况
-            stray_others = sorted(
-                (d for s, d in sq_diffs.items() if s != f_sq and s != t_sq),
-                reverse=True,
+            move, info = self.move_detector.detect(
+                base_img, curr_img, board, self.grid_mapper, rotated, self._baseline_ignored_squares,
             )
-            stray_penalty = max(0.0, (stray_others[0] - min(d_from, d_to)) * 0.4) if stray_others else 0.0
-
-            score = d_from + d_to + vacate_gain + vacate_wood + dest_gain + end_presence_bonus - stray_penalty
-            candidates.append((score, f_sq, t_sq, d_from, d_to))
-
-        if not candidates:
-            self.last_detection_info = {"changed_count": len(changed_squares), "reason": "无满足双格变动门槛的合法着法"}
-            return None
-
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        best_score, best_from, best_to, d_from, d_to = candidates[0]
-        second_score = candidates[1][0] if len(candidates) > 1 else 0.0
-        margin = best_score - second_score
-
-        if best_score < 22.0:
-            self.last_detection_info = {
-                "best_score": round(best_score, 2),
-                "margin": round(margin, 2),
-                "reason": f"最高分置信度不足 ({best_score:.1f} < 22.0)",
-            }
-            return None
-
-        # 如果存在另一个非同起点/终点的竞争着法分值极其接近（差值 < 2.5 且绝对分不大），判为歧义不强行猜步
-        if len(candidates) > 1 and margin < 2.0 and best_score < 45.0:
-            self.last_detection_info = {
-                "best_score": round(best_score, 2),
-                "second_score": round(second_score, 2),
-                "margin": round(margin, 2),
-                "reason": f"候选着法分差过小 (margin={margin:.2f})，存在遮挡或歧义",
-            }
-            return None
-
-        self.last_detection_info = {
-            "best_move": f"{best_from}{best_to}",
-            "best_score": round(best_score, 2),
-            "second_score": round(second_score, 2),
-            "margin": round(margin, 2),
-            "d_from": round(d_from, 2),
-            "d_to": round(d_to, 2),
-            "changed_count": len(changed_squares),
-            "reason": "matched",
-        }
-        print(
-            f"🎯 [严谨差分判定]: 锁定着法 {best_from} -> {best_to} "
-            f"(score={best_score:.1f}, margin={margin:.1f})"
-        )
-        return (best_from, best_to)
+        with self.lock:
+            if version != self.board_version:
+                return None
+            self.last_detection_info = info
+        return move
 
     def _get_calib_offset(self) -> Tuple[float, float, float]:
         """实时读取手眼微调偏置 (ΔX, ΔY, ΔZ mm)"""
@@ -822,6 +819,8 @@ class XiangqiAgent:
             "target_station": target_station,
             "speed": 25,
             "offset_trim": offset_trim,
+            "gripper_open_percent": CHESS_GRIPPER_OPEN_PERCENT,
+            "release_at_hover": True,
         }
         if cancel_token is not None:
             kwargs["cancel_token"] = cancel_token
@@ -830,8 +829,8 @@ class XiangqiAgent:
             raise RuntimeError(res.get("error", f"执行 {target_name} 抓放失败"))
         return res
 
-    def _physical_pick_and_place_square(self, sq: str, dest_station: str = "P4", cancel_token: Any = None):
-        """将指定格子的棋子拾取并移至预设工位 (如弃子盒 P4)"""
+    def _physical_pick_and_place_square(self, sq: str, dest_station: str = "P5", cancel_token: Any = None):
+        """将指定格子的棋子拾取并移至预设工位 (如弃子盒 P5)"""
         offset_trim = self._get_calib_offset()
         print(
             f"♟️ [象棋拾取] 格子={sq} -> 工位={dest_station}, "

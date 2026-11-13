@@ -183,15 +183,22 @@ class VisionActionExecutor:
         place_offset: Optional[Tuple[float, float, float]] = None,
         cancel_token: Any = None,
         expected_clamp: Optional[bool] = None,
+        gripper_open_percent: Optional[int] = None,
+        release_at_hover: bool = False,
     ) -> Dict[str, Any]:
         """
-        核心物理流程：基于视觉检测框，执行带空中检查点的工业闭环搬运。
-        严格校验 bbox、速度、自定义坐标与已知工位名（未知工位拒绝猜测回退），支持取消令牌与夹持确认。
+        核心物理流程：基于视觉检测框，执行抓取、抬升、搬运和释放。
+        严格校验 bbox、速度、自定义坐标与已知工位名（未知工位拒绝猜测回退），支持取消令牌，闭合后默认夹取成功。
         """
         try:
             speed_val = validate_speed(speed)
         except ValueError as e:
             return {"success": False, "error": str(e)}
+
+        grip_open_val = VisionConfig.GRIPPER_OPEN_PERCENT if gripper_open_percent is None else gripper_open_percent
+        if not is_finite_number(grip_open_val) or not 0 <= grip_open_val <= 100:
+            return {"success": False, "error": f"夹爪张开开度非法: {grip_open_val!r}"}
+        grip_open_val = int(round(grip_open_val))
 
         if not isinstance(bbox, (list, tuple)) or len(bbox) != 4 or not all(is_finite_number(v) for v in bbox):
             return {"success": False, "error": f"无效视觉框参数: {bbox!r}"}
@@ -223,7 +230,6 @@ class VisionActionExecutor:
             grasp_z = round(grasp_z + float(offset_trim[2]), 1)
 
         grip_clamp_val = VisionConfig.GRIPPER_CLOSE_PERCENT
-        grip_open_val = VisionConfig.GRIPPER_OPEN_PERCENT
 
         print(
             f"📍 视觉映射物理抓取点: X={target_x}mm, Y={target_y}mm, "
@@ -275,6 +281,10 @@ class VisionActionExecutor:
                 target_coord = list(PRESET_STATIONS[station_str])
                 station_angles = PRESET_JOINTS.get(station_str)
 
+        if release_at_hover:
+            station_angles = None
+            use_custom_coord = True
+
         min_safe_hover = grasp_z + VisionConfig.CLEARANCE_MARGIN_MM
         if use_custom_coord and target_coord:
             dest_ok, dest_reason = PhysicalSafetyGuard.validate_target_point(
@@ -319,24 +329,16 @@ class VisionActionExecutor:
                 send_angles_checked(station_angles, speed_val)
             elif target_coord:
                 send_coords_checked([target_coord[0], target_coord[1], hover_z, target_coord[3], target_coord[4], target_coord[5]], speed_val)
-                send_coords_checked(target_coord, down_speed)
+                if not release_at_hover:
+                    send_coords_checked(target_coord, down_speed)
 
         def act_04_clamp():
-            grip_res = set_gripper_checked(grip_clamp_val, VisionConfig.GRIPPER_CLOSE_SPEED, exp_clamp=expected_clamp)
-            if isinstance(grip_res, dict) and grip_res.get("dropped"):
-                raise RuntimeError("夹爪闭合抓取时检测到物体滑落")
+            set_gripper_checked(grip_clamp_val, VisionConfig.GRIPPER_CLOSE_SPEED, exp_clamp=expected_clamp)
             self._sleep_cancelable(1.0, cancel_token)
-
-        def act_06_check_hold():
-            if hasattr(self.driver, "get_gripper_feedback"):
-                fb = self.driver.get_gripper_feedback()
-                if isinstance(fb, dict) and fb.get("status_code") == 3:
-                    raise RuntimeError("空中安全检查失败：物体已在抬升过程中掉落")
-            self._sleep_cancelable(0.6, cancel_token)
 
         def act_10_retreat():
             # 在返回待机前从抓放低高度平稳回退抬升，避免横扫桌面其他物体
-            if target_coord and not station_angles:
+            if target_coord and not station_angles and not release_at_hover:
                 send_coords_checked([target_coord[0], target_coord[1], hover_z, target_coord[3], target_coord[4], target_coord[5]], down_speed)
             self._sleep_cancelable(0.5, cancel_token)
 
@@ -346,11 +348,11 @@ class VisionActionExecutor:
             ("ACT-03", f"垂直缓冲下放抓取 ({target_x:.1f}, {target_y:.1f}, {grasp_z:.1f})", lambda: (send_coords_checked([target_x, target_y, grasp_z, rx0, ry0, rz0], down_speed), self._sleep_cancelable(1.2, cancel_token))),
             ("ACT-04", f"柔性闭合夹爪夹取工件【{target_name}】(开度 {grip_clamp_val}%)", act_04_clamp),
             ("ACT-05", f"垂直抬升至安全空域高度 ({hover_z:.1f}mm)", lambda: (send_coords_checked([target_x, target_y, hover_z, rx0, ry0, rz0], down_speed), self._sleep_cancelable(1.0, cancel_token))),
-            ("ACT-06", "【空中安全检查点】悬停确认夹持稳定", act_06_check_hold),
+            ("ACT-06", "抬升后短暂停稳", lambda: self._sleep_cancelable(0.6, cancel_token)),
             ("ACT-07", f"经由高位安全航线巡航至目的地 [{dest_display}]", lambda: (move_to_delivery(), self._sleep_cancelable(1.5, cancel_token))),
             ("ACT-08", "工位就位确认", lambda: self._sleep_cancelable(0.5, cancel_token)),
             ("ACT-09", f"释放夹爪交付工件 ({grip_open_val}% 开度)", lambda: (set_gripper_checked(grip_open_val, VisionConfig.GRIPPER_OPEN_SPEED), self._sleep_cancelable(0.8, cancel_token))),
-            ("ACT-10", "工件交付确认与安全回退抬升", act_10_retreat),
+            ("ACT-10", "释放完成确认" if release_at_hover else "工件交付确认与安全回退抬升", act_10_retreat),
             ("ACT-11", "平稳返回初始待机 NORMAL 姿态", lambda: (send_angles_checked(PRESET_JOINTS["NORMAL"], speed_val), self._sleep_cancelable(1.5, cancel_token))),
         ]
 

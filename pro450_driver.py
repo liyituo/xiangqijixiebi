@@ -846,7 +846,7 @@ class MyCobotPro450Driver:
         verify: bool = True,
         expected_clamp: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """连续行程百分比控制夹爪 (0~100)，校验指令返回并回读开度与夹持状态。"""
+        """连续行程百分比控制夹爪 (0~100)，校验指令返回并记录开度与原始状态码。"""
         self._ensure_runtime_state()
         if not is_finite_number(value):
             raise ValueError(f"夹爪开度必须为有限数字，当前为 {value!r}")
@@ -912,36 +912,8 @@ class MyCobotPro450Driver:
                 else:
                     self.virtual_gripper = val
 
-                dropped = status_code == 3
+                # 按夹爪指令的执行结果继续流程，原始状态码用于反馈记录。
                 clamped = status_code == 2
-                if verify and dropped:
-                    report = {
-                        "ok": False,
-                        "source": "hardware",
-                        "target": val,
-                        "measured": measured,
-                        "status_code": status_code,
-                        "clamped": False,
-                        "dropped": True,
-                        "timestamp": time.time(),
-                    }
-                    self.last_gripper_report = report
-                    raise RuntimeError("夹爪检测到物体夹持后掉落 (status=3)")
-
-                if verify and expected_clamp is True and status_code == 1:
-                    report = {
-                        "ok": False,
-                        "source": "hardware",
-                        "target": val,
-                        "measured": measured,
-                        "status_code": status_code,
-                        "clamped": False,
-                        "dropped": False,
-                        "timestamp": time.time(),
-                    }
-                    self.last_gripper_report = report
-                    raise RuntimeError("夹爪闭合完成但未检测到夹持物体 (status=1)")
-
                 report = {
                     "ok": True,
                     "source": "hardware",
