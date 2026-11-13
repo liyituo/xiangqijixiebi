@@ -3,8 +3,10 @@ import sys
 import json
 import time
 import re
+import hmac
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -14,6 +16,17 @@ app = FastAPI(
     description="基于 Qwen2.5-1.5B-Instruct 与 NVIDIA RTX 4080 的机械臂自然语言意图控制 API",
     version="1.0.0"
 )
+
+
+@app.middleware("http")
+async def _verify_api_token(request: Request, call_next):
+    expected = os.environ.get("ROBOT_API_TOKEN", "").strip()
+    if expected and request.url.path not in ("/health", "/docs", "/openapi.json"):
+        auth_hdr = request.headers.get("Authorization", "")
+        token = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else request.headers.get("X-Robot-Token", "").strip()
+        if not token or not hmac.compare_digest(token, expected):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 MODEL_PATH = "/root/autodl-tmp/Qwen2.5-1.5B-Instruct"
 
@@ -224,5 +237,6 @@ def handle_robot_command(req: CommandRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # 监听 0.0.0.0:6006 (AutoDL 标准服务端口)
-    uvicorn.run(app, host="0.0.0.0", port=6006)
+    host = os.environ.get("API_HOST", "127.0.0.1")
+    port = int(os.environ.get("API_PORT", "6006"))
+    uvicorn.run(app, host=host, port=port)

@@ -152,17 +152,7 @@ def run_one_click_board_localization() -> Dict[str, Any]:
 
     except Exception as e:
         print(f"❌ 大模型定位失败: {e}")
-        # 回退使用已有配置或标准默认
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    raw_corners = data.get("corners_norm", {})
-                print("⚠️ 已自动回退加载历史标定角点。")
-            except Exception:
-                return {"success": False, "error": str(e)}
-        else:
-            return {"success": False, "error": str(e)}
+        return {"success": False, "error": f"棋盘角点自动定位失败: {e}"}
 
     # 3. OpenCV 亚像素几何自适应精修
     print("\n🔍 [步骤 3/4]: 正在执行 OpenCV 亚像素物理网格对齐...")

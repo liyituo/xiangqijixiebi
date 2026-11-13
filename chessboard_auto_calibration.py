@@ -28,6 +28,7 @@ import cv2
 from typing import List, Tuple, Optional, Dict, Any
 
 from pro450_driver import MyCobotPro450Driver
+from vision_calibration import save_calibration
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "calibration_config.json")
 RESULT_IMG_FILE = os.path.join(os.path.dirname(__file__), "chessboard_calibration_result.jpg")
@@ -71,26 +72,51 @@ def capture_frame_live(cap: Optional[cv2.VideoCapture]) -> Optional[np.ndarray]:
     return None
 
 
+def normalize_chessboard_corners(
+    corners: np.ndarray,
+    detected_pattern: Tuple[int, int],
+    target_pattern: Tuple[int, int] = PATTERN_SIZE,
+) -> np.ndarray:
+    """
+    将 OpenCV findChessboardCorners 输出的角点统一重排为 (rows, cols) 行主序，
+    并按图像左上角 (col=0, row=0) -> 右下角 (col=cols-1, row=rows-1) 规范化方向。
+    """
+    det_cols, det_rows = int(detected_pattern[0]), int(detected_pattern[1])
+    tgt_cols, tgt_rows = int(target_pattern[0]), int(target_pattern[1])
+    arr = np.asarray(corners, dtype=np.float32).reshape(det_rows, det_cols, 2)
+    if (det_cols, det_rows) == (tgt_rows, tgt_cols):
+        grid = arr.transpose(1, 0, 2)
+    elif (det_cols, det_rows) == (tgt_cols, tgt_rows):
+        grid = arr
+    else:
+        raise ValueError(f"不匹配的棋盘格角点尺寸: detected={detected_pattern}, target={target_pattern}")
+
+    # 方向规范化：保证第 0 列在左、第 -1 列在右；第 0 行在上、第 -1 行在下
+    if grid[0, -1, 0] < grid[0, 0, 0]:
+        grid = grid[:, ::-1, :]
+    if grid[-1, 0, 1] < grid[0, 0, 1]:
+        grid = grid[::-1, :, :]
+    return grid.reshape(-1, 2)
+
+
 def detect_chessboard_subpix(frame: np.ndarray, pattern: Tuple[int, int] = PATTERN_SIZE):
-    """亚像素级检测棋盘格角点"""
+    """亚像素级检测棋盘格角点，统一为行主序左上到右下。"""
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE + cv2.CALIB_CB_FAST_CHECK
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+
     ret, corners = cv2.findChessboardCorners(gray, pattern, flags)
+    detected_pattern = pattern
     if not ret:
-        # 尝试逆序匹配 (9, 6)
         alt_pattern = (pattern[1], pattern[0])
         ret, corners = cv2.findChessboardCorners(gray, alt_pattern, flags)
-        if ret:
-            # 转置为 (6, 9) 顺序
-            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-            corners_sub = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-            grid = corners_sub.reshape(pattern[1], pattern[0], 2).transpose(1, 0, 2).reshape(-1, 2)
-            return True, grid
-        return False, None
+        if not ret:
+            return False, None
+        detected_pattern = alt_pattern
 
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
-    corners_sub = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria).reshape(-1, 2)
-    return True, corners_sub
+    corners_sub = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+    grid = normalize_chessboard_corners(corners_sub, detected_pattern, target_pattern=pattern)
+    return True, grid
 
 
 def compute_54_points_grid(four_robot_corners: List[Tuple[float, float, float]]) -> List[Tuple[float, float, float]]:
@@ -393,11 +419,12 @@ def run_chessboard_auto_calibration():
     else:
         print("   ⚠️ 标定误差略大，建议检查 4 个角点对准中心度后重试。")
 
-    # 9. 构造与更新 calibration_config.json
+    # 9. 构造并原子更新 calibration_config.json (保留手动偏置与相机扩展字段)
     calib_data = {
         "calibration_type": "chessboard_auto_54p",
         "pattern_size": list(PATTERN_SIZE),
         "square_size_mm": SQUARE_SIZE_MM,
+        "image_size_px": [int(w), int(h)],
         "table_z_mm": round(table_z, 2),
         "hover_clearance_mm": round(table_z + 110.0, 2),
         "rmse_mm": round(rmse, 3),
@@ -411,17 +438,15 @@ def run_chessboard_auto_calibration():
             [round(float(img_norm_pts[53][0]), 2), round(float(img_norm_pts[53][1]), 2)],
             [round(float(img_norm_pts[48][0]), 2), round(float(img_norm_pts[48][1]), 2)],
         ],
-        "homography_matrix": H_matrix.tolist()
+        "homography_matrix": H_matrix.tolist(),
     }
 
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(calib_data, f, indent=4, ensure_ascii=False)
-    print(f"\n💾 标定配置文件已成功保存并即时生效: {CONFIG_FILE}")
+    save_calibration(calib_data, config_path=CONFIG_FILE)
+    print(f"\n💾 标定配置文件已原子保存并保留手眼偏置: {CONFIG_FILE}")
+    print("ℹ️  注意: 本次拟合有效区域严格覆盖棋盘格内部 (boundary_polygon)，棋盘外大范围外推存在畸变误差。")
 
     # 10. 生成标定诊断全景图
     diag_img = frame.copy()
-    # 绘制全部真实像素点与预测反投点
-    H_inv = np.linalg.inv(H_matrix)
     for idx, (img_pt, rob_pt) in enumerate(zip(cached_corners, rob_pts_2d)):
         u, v = int(round(img_pt[0])), int(round(img_pt[1]))
         cv2.circle(diag_img, (u, v), 3, (0, 255, 0), -1)

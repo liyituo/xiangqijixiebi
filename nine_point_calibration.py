@@ -24,6 +24,8 @@ import numpy as np
 import cv2
 from typing import List, Tuple, Optional
 
+from vision_calibration import save_calibration
+
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "calibration_config.json")
 SNAPSHOT_FILE = os.path.join(os.path.dirname(__file__), "current_table_snapshot.jpg")
 
@@ -74,8 +76,10 @@ def fetch_robot_coords_auto() -> Optional[Tuple[float, float, float]]:
         r = requests.get("http://127.0.0.1:5000/api/status", timeout=1.0)
         if r.status_code == 200:
             data = r.json()
-            pose = data.get("current_pose")
-            if pose and len(pose) >= 3 and any(v != 0 for v in pose[:3]):
+            pose = data.get("coords")
+            if not pose:
+                pose = data.get("current_pose")
+            if pose and len(pose) >= 3 and any(float(v) != 0.0 for v in pose[:3]):
                 return float(pose[0]), float(pose[1]), float(pose[2])
     except Exception:
         pass
@@ -233,9 +237,10 @@ def run_nine_point_calibration():
     else:
         print("  ⚠️ 标定质量评定: 【偏大】- 建议检查个别偏差较大的点是否有手误。")
 
-    # 保存至 calibration_config.json
+    # 保存至 calibration_config.json (原子写入，保留偏置与元数据)
     calib_payload = {
         "calibration_type": "9_point_grid",
+        "image_size_px": [int(w), int(h)],
         "image_points": img_norm_pts.tolist(),
         "robot_points": rob_pts_arr.tolist(),
         "point_names": POINT_NAMES,
@@ -243,12 +248,12 @@ def run_nine_point_calibration():
         "hover_clearance_mm": avg_z + 110.0,
         "rmse_mm": round(float(rmse), 2),
         "max_error_mm": round(float(max_err), 2),
+        "homography_matrix": H.tolist(),
         "calibration_time": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(calib_payload, f, indent=4, ensure_ascii=False)
-    print(f"\n💾 9 点标定参数已成功写入配置文件: {CONFIG_FILE}")
+    save_calibration(calib_payload, config_path=CONFIG_FILE)
+    print(f"\n💾 9 点标定参数已原子写入配置文件 (并保留手眼偏置): {CONFIG_FILE}")
 
     # 生成 9 点标定可视化残差报告图
     res_img = frame.copy()

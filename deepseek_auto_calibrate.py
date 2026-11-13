@@ -16,6 +16,7 @@ import numpy as np
 import cv2
 
 from env_loader import get_vlm_api_key
+from vision_calibration import save_calibration
 
 DEEPSEEK_API_KEY = get_vlm_api_key("DIRECT_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = "deepseek-flash"
@@ -157,26 +158,31 @@ def run_deepseek_calibration():
         ny = float(pt[1]) * 1000.0 if max(pt) <= 1.05 else float(pt[1])
         detected_img_pts.append([round(nx, 1), round(ny, 1)])
 
+    # 计算透视单应性矩阵
+    src_pts = np.array(detected_img_pts, dtype=np.float32)
+    dst_pts = np.array(PHYSICAL_ROBOT_CORNERS, dtype=np.float32)
+    H, _ = cv2.findHomography(src_pts, dst_pts)
+    if H is None:
+        print("❌ 单应性矩阵计算失败，标定未保存。")
+        return
+
     # 组装标定数据
     calib_payload = {
+        "calibration_type": "deepseek_4_point",
+        "image_size_px": [int(w), int(h)],
         "image_points": detected_img_pts,
         "robot_points": PHYSICAL_ROBOT_CORNERS,
         "corners_label": labels,
         "table_z_mm": TABLE_Z,
         "hover_clearance_mm": HOVER_Z,
+        "homography_matrix": H.tolist(),
         "calibrated_by": "DeepSeek-V4.1-Flash",
         "calibration_time": time.strftime("%Y-%m-%d %H:%M:%S")
     }
 
-    # 写入 calibration_config.json
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(calib_payload, f, indent=4, ensure_ascii=False)
-    print(f"💾 已将 DeepSeek 标定参数写入: {CONFIG_FILE}")
-
-    # 计算透视单应性矩阵
-    src_pts = np.array(detected_img_pts, dtype=np.float32)
-    dst_pts = np.array(PHYSICAL_ROBOT_CORNERS, dtype=np.float32)
-    H, _ = cv2.findHomography(src_pts, dst_pts)
+    # 原子写入 calibration_config.json (保留手动偏置等扩展字段)
+    save_calibration(calib_payload, config_path=CONFIG_FILE)
+    print(f"💾 已将 DeepSeek 标定参数原子写入: {CONFIG_FILE}")
 
     print("\n🎯 DeepSeek 标定手眼对齐矩阵 (Homography):")
     for r in H:

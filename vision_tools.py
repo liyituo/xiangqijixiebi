@@ -21,9 +21,10 @@ import math
 import requests
 import numpy as np
 import cv2
+import inspect
 from typing import Dict, Any, List, Tuple, Optional
 from vision_calibration import HandEyeMapper
-from pro450_driver import clamp_angles, clamp_coords, PRO450_LIMITS
+from pro450_driver import clamp_angles, clamp_coords, PRO450_LIMITS, is_finite_number, validate_speed
 
 # 预设工位笛卡尔坐标 (X, Y, Z, Rx, Ry, Rz mm/deg) - 真实物理标定示教数据
 PRESET_STATIONS = {
@@ -50,15 +51,28 @@ PRESET_JOINTS = {
 }
 
 
-class PhysicalSafetyGuard:
-    """五重物理硬约束安全审查 (全面适配 myCobot Pro 450 工作包络)"""
+class VisionConfig:
+    """具身视觉抓放与夹爪唯一参数源 (Single Source of Truth)"""
+    GRIPPER_OPEN_PERCENT = 15
+    GRIPPER_CLOSE_PERCENT = 5
+    GRIPPER_OPEN_SPEED = 50
+    GRIPPER_CLOSE_SPEED = 35
+    GRASP_Z_OFFSET_MM = -2.0       # table_z - 2.0mm 稳定贴桌抓取高度
+    HOVER_OFFSET_MM = 45.0
+    HOVER_MIN_Z_MM = 210.0
+    HOVER_MAX_Z_MM = 240.0
+    CLEARANCE_MARGIN_MM = 15.0
+    DEFAULT_PICK_ORIENTATION = (-178.5, -3.1, 46.0)
 
-    # 机械臂物理工作包络限制 (mm) - 适配 myCobot Pro 450 450mm 大臂展
-    X_MIN, X_MAX = -460.0, 460.0
-    Y_MIN, Y_MAX = -460.0, 460.0
-    Z_MIN, Z_MAX = 10.0, 700.0       # 防止撞击工作台，底线 10mm，允许直立高位 (700mm)
-    R_MAX = 475.0                    # Pro 450 最大物理展开半径
-    R_MIN = 0.0                      # 允许垂直中心作业区
+
+class PhysicalSafetyGuard:
+    """五重物理硬约束安全审查 (与 PRO450_LIMITS 对齐)"""
+
+    X_MIN, X_MAX = PRO450_LIMITS["coords_min"][0], PRO450_LIMITS["coords_max"][0]
+    Y_MIN, Y_MAX = PRO450_LIMITS["coords_min"][1], PRO450_LIMITS["coords_max"][1]
+    Z_MIN, Z_MAX = PRO450_LIMITS["table_safety_z"], PRO450_LIMITS["coords_max"][2]
+    R_MAX = 475.0
+    R_MIN = 0.0
 
     # 单步最大增量限制 (防大模型幻觉暴冲)
     MAX_STEP_XYZ = 50.0              # mm
@@ -66,37 +80,42 @@ class PhysicalSafetyGuard:
 
     @classmethod
     def validate_target_point(cls, x: float, y: float, z: float) -> Tuple[bool, str]:
-        """验证空间点位是否在绝对安全工作空间内"""
-        dist = math.sqrt(x**2 + y**2)
+        """验证空间点位是否有限且位于绝对安全工作空间内"""
+        if not (is_finite_number(x) and is_finite_number(y) and is_finite_number(z)):
+            return False, f"目标坐标包含非有限值: ({x!r}, {y!r}, {z!r})"
+        fx, fy, fz = float(x), float(y), float(z)
+        dist = math.sqrt(fx**2 + fy**2)
         if dist > cls.R_MAX:
             return False, f"物理超程: 半径距离 {dist:.1f}mm 超过安全极限 {cls.R_MAX}mm"
         if dist < cls.R_MIN:
             return False, f"过近盲区: 距离 {dist:.1f}mm 进入基座干涉区 (<{cls.R_MIN}mm)"
 
-        if not (cls.X_MIN <= x <= cls.X_MAX):
-            return False, f"X坐标越界 [{x:.1f}mm]，安全范围为 [{cls.X_MIN}, {cls.X_MAX}]mm"
-        if not (cls.Y_MIN <= y <= cls.Y_MAX):
-            return False, f"Y坐标越界 [{y:.1f}mm]，安全范围为 [{cls.Y_MIN}, {cls.Y_MAX}]mm"
-        if not (cls.Z_MIN <= z <= cls.Z_MAX):
-            return False, f"Z高度越界 [{z:.1f}mm]，防止撞击桌面 (允许范围 [{cls.Z_MIN}, {cls.Z_MAX}]mm)"
+        if not (cls.X_MIN <= fx <= cls.X_MAX):
+            return False, f"X坐标越界 [{fx:.1f}mm]，安全范围为 [{cls.X_MIN}, {cls.X_MAX}]mm"
+        if not (cls.Y_MIN <= fy <= cls.Y_MAX):
+            return False, f"Y坐标越界 [{fy:.1f}mm]，安全范围为 [{cls.Y_MIN}, {cls.Y_MAX}]mm"
+        if not (cls.Z_MIN <= fz <= cls.Z_MAX):
+            return False, f"Z高度越界 [{fz:.1f}mm]，防止撞击桌面 (允许范围 [{cls.Z_MIN}, {cls.Z_MAX}]mm)"
 
         return True, "安全审查通过"
 
     @classmethod
     def validate_delta_step(cls, dx: float, dy: float, dz: float,
                             drx: float = 0.0, dry: float = 0.0, drz: float = 0.0) -> Tuple[bool, str]:
-        """验证单步微调增量是否超出安全阈值"""
-        dist_delta = math.sqrt(dx**2 + dy**2 + dz**2)
-        if dist_delta > cls.MAX_STEP_XYZ:
+        """验证单步微调增量是否有限且在安全阈值内"""
+        if not all(is_finite_number(v) for v in (dx, dy, dz, drx, dry, drz)):
+            return False, "增量包含非有限值或非法类型"
+        dist_delta = math.sqrt(float(dx)**2 + float(dy)**2 + float(dz)**2)
+        if dist_delta > cls.MAX_STEP_XYZ + 1e-6:
             return False, f"单步平移过大: {dist_delta:.1f}mm > {cls.MAX_STEP_XYZ}mm，自动限幅保护"
-        rot_delta = max(abs(drx), abs(dry), abs(drz))
-        if rot_delta > cls.MAX_STEP_ROT:
+        rot_delta = max(abs(float(drx)), abs(float(dry)), abs(float(drz)))
+        if rot_delta > cls.MAX_STEP_ROT + 1e-6:
             return False, f"单步旋转过大: {rot_delta:.1f}deg > {cls.MAX_STEP_ROT}deg"
         return True, "增量安全"
 
     @staticmethod
     def validate_station(station_name: str) -> bool:
-        return station_name.upper() in PRESET_STATIONS
+        return isinstance(station_name, str) and station_name.strip().upper() in PRESET_STATIONS
 
 
 class VisionActionExecutor:
@@ -105,6 +124,50 @@ class VisionActionExecutor:
     def __init__(self, driver, mapper: HandEyeMapper):
         self.driver = driver
         self.mapper = mapper
+
+    def _call_driver_method(self, method_name: str, *args, **kwargs):
+        """安全调用驱动方法，仅在目标签名支持时透传 cancel_token / expected_clamp / allow_cache 等可选参数。"""
+        fn = getattr(self.driver, method_name)
+        try:
+            sig = inspect.signature(fn)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if has_var_kw:
+                filtered = kwargs
+            else:
+                filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        except (TypeError, ValueError):
+            filtered = {}
+        return fn(*args, **filtered)
+
+    def _read_fresh_coords(self) -> Tuple[Optional[List[float]], Optional[str]]:
+        if hasattr(self.driver, "get_coords"):
+            res = self._call_driver_method("get_coords", allow_cache=False)
+            if isinstance(res, (list, tuple)) and len(res) >= 6 and all(is_finite_number(v) for v in res[:6]):
+                return [float(v) for v in res[:6]], None
+        return None, "无法读取机械臂当前真实坐标，请检查驱动连接或反馈状态"
+
+    def _read_fresh_angles(self) -> Tuple[Optional[List[float]], Optional[str]]:
+        if hasattr(self.driver, "get_angles"):
+            res = self._call_driver_method("get_angles", allow_cache=False)
+            if isinstance(res, (list, tuple)) and len(res) >= 6 and all(is_finite_number(v) for v in res[:6]):
+                return [float(v) for v in res[:6]], None
+        return None, "无法读取机械臂当前真实关节角，请检查驱动连接或反馈状态"
+
+    def _check_cancelled(self, cancel_token: Any = None):
+        backend = getattr(self.driver, "backend", self.driver)
+        stop_requested = getattr(backend, "stop_requested", None)
+        if stop_requested is not None and stop_requested.is_set():
+            raise RuntimeError("动作已被停止，后续步骤未执行")
+        if cancel_token is not None and hasattr(cancel_token, "is_cancelled") and cancel_token.is_cancelled():
+            raise RuntimeError("动作已被取消，后续步骤未执行")
+
+    def _sleep_cancelable(self, seconds: float, cancel_token: Any = None):
+        if cancel_token is not None and hasattr(cancel_token, "wait"):
+            cancel_token.wait(seconds, step=0.05)
+            self._check_cancelled(cancel_token)
+        else:
+            time.sleep(seconds)
+            self._check_cancelled(cancel_token)
 
     # --------------------------------------------------------------------------
     # Tool 1: 视觉目标检测与 11 步搬运工序 (Visual Pick & Place)
@@ -117,72 +180,102 @@ class VisionActionExecutor:
         speed: int = 15,
         step_callback: Optional[callable] = None,
         offset_trim: Optional[Tuple[float, float, float]] = None,
-        place_offset: Optional[Tuple[float, float, float]] = None
+        place_offset: Optional[Tuple[float, float, float]] = None,
+        cancel_token: Any = None,
+        expected_clamp: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """
-        核心物理流程：基于视觉检测框，执行带空中检查点的工业闭环搬运
-        支持自定义点位坐标 (解除仅限固定工位的死板限制) 与批量阵列排布偏置 (place_offset)
-        支持 offset_trim 手眼标定偏置微调补偿 (ΔX, ΔY, ΔZ)
+        核心物理流程：基于视觉检测框，执行带空中检查点的工业闭环搬运。
+        严格校验 bbox、速度、自定义坐标与已知工位名（未知工位拒绝猜测回退），支持取消令牌与夹持确认。
         """
+        try:
+            speed_val = validate_speed(speed)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4 or not all(is_finite_number(v) for v in bbox):
+            return {"success": False, "error": f"无效视觉框参数: {bbox!r}"}
+        ymin, xmin, ymax, xmax = [float(v) for v in bbox]
+        if ymax < ymin or xmax < xmin or min(ymin, xmin) < 0.0 or max(ymax, xmax) > 1000.0:
+            return {"success": False, "error": f"视觉框范围或顺序非法: {bbox!r}"}
+
+        if offset_trim is not None:
+            if not isinstance(offset_trim, (list, tuple)) or len(offset_trim) < 3 or not all(is_finite_number(v) for v in offset_trim[:3]):
+                return {"success": False, "error": f"手眼偏置参数非法: {offset_trim!r}"}
+        if place_offset is not None:
+            if not isinstance(place_offset, (list, tuple)) or len(place_offset) < 3 or not all(is_finite_number(v) for v in place_offset[:3]):
+                return {"success": False, "error": f"放置偏移参数非法: {place_offset!r}"}
+
         dest_display = str(target_station)
         print(f"\n🚀 >>> 启动视觉抓取工序: 目标【{target_name}】 -> 目标目的地【{dest_display}】")
-        
+
         # 1. 坐标换算与映射
         target_x, target_y, table_z = self.mapper.bbox_to_robot_center(bbox)
-        # 动态自适应安全过渡高度：桌面+45mm，既确保绝对跨越棋子与工件，又严格处于机械臂可达球域内（彻底避免无逆解）
-        hover_z = min(240.0, max(210.0, table_z + 45.0))
-        
-        # 在原抓取目标的基础上降低 10 mm，桌面基准和悬停高度保持不变。
-        grasp_z = table_z + 8.0 - 10.0
+        hover_z = min(
+            VisionConfig.HOVER_MAX_Z_MM,
+            max(VisionConfig.HOVER_MIN_Z_MM, table_z + VisionConfig.HOVER_OFFSET_MM),
+        )
+        grasp_z = round(table_z + VisionConfig.GRASP_Z_OFFSET_MM, 1)
 
-        # 叠加手眼标定微调偏置
         if offset_trim:
-            target_x = round(target_x + offset_trim[0], 1)
-            target_y = round(target_y + offset_trim[1], 1)
-            grasp_z = round(grasp_z + offset_trim[2], 1)
-        
-        # 夹爪柔性闭合：满足用户定制要求（最大开角 15%，闭合抓取 5%）
-        is_tape = any(k in str(target_name) for k in ["胶带", "圆", "筒", "盒", "block", "tape", "零件"])
-        grip_clamp_val = 5  # 闭合抓取开度调紧至 5%
-        grip_open_val = 15  # 最大开角度调整为 15%
-        
-        print(f"📍 视觉映射物理抓取点: X={target_x}mm, Y={target_y}mm, 缓冲抓取高度 Z={grasp_z}mm (离地过渡 Z={hover_z}mm), 夹爪参数: 开={grip_open_val}%, 闭={grip_clamp_val}%")
+            target_x = round(target_x + float(offset_trim[0]), 1)
+            target_y = round(target_y + float(offset_trim[1]), 1)
+            grasp_z = round(grasp_z + float(offset_trim[2]), 1)
 
-        # 2. 安全防火墙硬拦截
+        grip_clamp_val = VisionConfig.GRIPPER_CLOSE_PERCENT
+        grip_open_val = VisionConfig.GRIPPER_OPEN_PERCENT
+
+        print(
+            f"📍 视觉映射物理抓取点: X={target_x}mm, Y={target_y}mm, "
+            f"抓取高度 Z={grasp_z}mm (过渡 Z={hover_z}mm), 夹爪: 开={grip_open_val}%, 闭={grip_clamp_val}%"
+        )
+
+        # 2. 抓取点安全防火墙硬拦截
         safe_ok, safe_reason = PhysicalSafetyGuard.validate_target_point(target_x, target_y, grasp_z)
         if not safe_ok:
             print(f"🛑 [安全防火墙硬拦截]: {safe_reason}！取消动作以保护硬件。")
             return {"success": False, "error": safe_reason}
 
-        # 3. 解析目标目的地（解除死板工位限制：支持预设工位名、自定义笛卡尔坐标、阵列排布偏移）
+        # 3. 严格解析目标目的地 (禁止将未知工位名静默回退到 P5)
         use_custom_coord = False
         target_coord = None
         station_angles = None
 
-        if isinstance(target_station, (list, tuple)) and len(target_station) >= 2:
+        if isinstance(target_station, (list, tuple)):
+            if len(target_station) < 2 or not all(is_finite_number(v) for v in target_station[:min(6, len(target_station))]):
+                return {"success": False, "error": f"自定义目的地坐标格式或数值非法: {target_station!r}"}
             use_custom_coord = True
             dx = float(target_station[0])
             dy = float(target_station[1])
             dz = float(target_station[2]) if len(target_station) >= 3 else (table_z + 8.0)
+            rx = float(target_station[3]) if len(target_station) >= 4 else VisionConfig.DEFAULT_PICK_ORIENTATION[0]
+            ry = float(target_station[4]) if len(target_station) >= 5 else VisionConfig.DEFAULT_PICK_ORIENTATION[1]
+            rz = float(target_station[5]) if len(target_station) >= 6 else VisionConfig.DEFAULT_PICK_ORIENTATION[2]
             if place_offset:
-                dx += place_offset[0]
-                dy += place_offset[1]
-                dz += place_offset[2]
-            target_coord = [dx, dy, dz, -178.5, -3.1, 46.0]
+                dx += float(place_offset[0])
+                dy += float(place_offset[1])
+                dz += float(place_offset[2])
+            target_coord = [round(dx, 2), round(dy, 2), round(dz, 2), rx, ry, rz]
         else:
-            station_str = str(target_station).strip().upper()
-            if station_str not in PRESET_STATIONS:
-                station_str = "P5"
+            if not isinstance(target_station, str) or not target_station.strip():
+                return {"success": False, "error": f"无效目标工位: {target_station!r}"}
+            station_str = target_station.strip().upper()
+            if station_str not in PRESET_STATIONS and station_str not in PRESET_JOINTS:
+                return {"success": False, "error": f"未知目标工位 '{target_station}'，拒绝使用默认工位覆盖"}
             if place_offset:
                 use_custom_coord = True
                 base = PRESET_STATIONS[station_str]
-                target_coord = [base[0] + place_offset[0], base[1] + place_offset[1], base[2] + place_offset[2], base[3], base[4], base[5]]
+                target_coord = [
+                    round(base[0] + float(place_offset[0]), 2),
+                    round(base[1] + float(place_offset[1]), 2),
+                    round(base[2] + float(place_offset[2]), 2),
+                    base[3], base[4], base[5],
+                ]
             else:
-                target_coord = PRESET_STATIONS[station_str]
+                target_coord = list(PRESET_STATIONS[station_str])
                 station_angles = PRESET_JOINTS.get(station_str)
 
-        # 自定义终点（含象棋落子点+手动微调偏置）同样执行安全边界硬拦截，并确保过渡悬停高度不低于抓放高度
-        min_safe_hover = grasp_z + 15.0
+        min_safe_hover = grasp_z + VisionConfig.CLEARANCE_MARGIN_MM
         if use_custom_coord and target_coord:
             dest_ok, dest_reason = PhysicalSafetyGuard.validate_target_point(
                 target_coord[0], target_coord[1], target_coord[2]
@@ -190,44 +283,85 @@ class VisionActionExecutor:
             if not dest_ok:
                 print(f"🛑 [安全防火墙硬拦截]: 目标放置点不安全 ({dest_reason})！取消动作以保护硬件。")
                 return {"success": False, "error": f"目标放置点安全拦截: {dest_reason}"}
-            min_safe_hover = max(min_safe_hover, target_coord[2] + 15.0)
-        hover_z = max(hover_z, min_safe_hover)
+            min_safe_hover = max(min_safe_hover, target_coord[2] + VisionConfig.CLEARANCE_MARGIN_MM)
+        hover_z = round(max(hover_z, min_safe_hover), 1)
 
         # 4. 构造高安全性工业搬运闭环
-        down_speed = max(5, int(speed * 0.6))
+        down_speed = max(5, int(speed_val * 0.6))
+        rx0, ry0, rz0 = VisionConfig.DEFAULT_PICK_ORIENTATION
+
+        def send_coords_checked(coords, spd):
+            res = self._call_driver_method("send_coords", coords, speed=spd, cancel_token=cancel_token)
+            if isinstance(res, dict) and res.get("ok") is False:
+                raise RuntimeError(res.get("error", "机械臂移动失败"))
+            return res
+
+        def send_angles_checked(angles, spd):
+            res = self._call_driver_method("send_angles", angles, speed=spd, cancel_token=cancel_token)
+            if isinstance(res, dict) and res.get("ok") is False:
+                raise RuntimeError(res.get("error", "机械臂关节移动失败"))
+            return res
+
+        def set_gripper_checked(val, spd, exp_clamp=None):
+            res = self._call_driver_method(
+                "set_gripper_value",
+                val,
+                speed=spd,
+                cancel_token=cancel_token,
+                expected_clamp=exp_clamp,
+            )
+            if isinstance(res, dict) and res.get("ok") is False:
+                raise RuntimeError(res.get("error", "夹爪动作失败"))
+            return res
+
         def move_to_delivery():
             if station_angles:
-                self.driver.send_angles(station_angles, speed=speed)
+                send_angles_checked(station_angles, speed_val)
             elif target_coord:
-                # 先到安全悬停点，再平稳下放交付
-                self.driver.send_coords([target_coord[0], target_coord[1], hover_z, target_coord[3], target_coord[4], target_coord[5]], speed=speed)
-                self.driver.send_coords(target_coord, speed=down_speed)
+                send_coords_checked([target_coord[0], target_coord[1], hover_z, target_coord[3], target_coord[4], target_coord[5]], speed_val)
+                send_coords_checked(target_coord, down_speed)
+
+        def act_04_clamp():
+            grip_res = set_gripper_checked(grip_clamp_val, VisionConfig.GRIPPER_CLOSE_SPEED, exp_clamp=expected_clamp)
+            if isinstance(grip_res, dict) and grip_res.get("dropped"):
+                raise RuntimeError("夹爪闭合抓取时检测到物体滑落")
+            self._sleep_cancelable(1.0, cancel_token)
+
+        def act_06_check_hold():
+            if hasattr(self.driver, "get_gripper_feedback"):
+                fb = self.driver.get_gripper_feedback()
+                if isinstance(fb, dict) and fb.get("status_code") == 3:
+                    raise RuntimeError("空中安全检查失败：物体已在抬升过程中掉落")
+            self._sleep_cancelable(0.6, cancel_token)
+
+        def act_10_retreat():
+            # 在返回待机前从抓放低高度平稳回退抬升，避免横扫桌面其他物体
+            if target_coord and not station_angles:
+                send_coords_checked([target_coord[0], target_coord[1], hover_z, target_coord[3], target_coord[4], target_coord[5]], down_speed)
+            self._sleep_cancelable(0.5, cancel_token)
 
         steps = [
-            ("ACT-01", f"张开自适应夹爪 ({grip_open_val}% 开度)", lambda: (self.driver.set_gripper_value(grip_open_val, speed=50), time.sleep(0.4))),
-            ("ACT-02", f"平移至物体上方安全悬停点 ({target_x:.1f}, {target_y:.1f}, {hover_z:.1f})", lambda: (self.driver.send_coords([target_x, target_y, hover_z, -178.5, -3.1, 46.0], speed), time.sleep(1.2))),
-            ("ACT-03", f"垂直缓冲下放抓取 ({target_x:.1f}, {target_y:.1f}, {grasp_z:.1f})", lambda: (self.driver.send_coords([target_x, target_y, grasp_z, -178.5, -3.1, 46.0], speed=down_speed), time.sleep(1.2))),
-            ("ACT-04", f"柔性闭合夹爪夹取工件【{target_name}】(开度 {grip_clamp_val}%)", lambda: (self.driver.set_gripper_value(grip_clamp_val, speed=35), time.sleep(1.0))),
-            ("ACT-05", f"垂直抬升至安全空域高度 ({hover_z:.1f}mm)", lambda: (self.driver.send_coords([target_x, target_y, hover_z, -178.5, -3.1, 46.0], speed=down_speed), time.sleep(1.0))),
-            ("ACT-06", f"【空中安全检查点】悬停确认夹持稳定", lambda: time.sleep(0.6)),
-            ("ACT-07", f"经由高位安全航线巡航至目的地 [{dest_display}]", lambda: (move_to_delivery(), time.sleep(1.5))),
-            ("ACT-08", f"工位就位确认", lambda: time.sleep(0.5)),
-            ("ACT-09", f"释放夹爪交付工件 ({grip_open_val}% 开度)", lambda: (self.driver.set_gripper_value(grip_open_val, speed=50), time.sleep(0.8))),
-            ("ACT-10", f"工件交付确认与安全脱离", lambda: time.sleep(0.5)),
-            ("ACT-11", f"平稳返回初始待机 NORMAL 姿态", lambda: (self.driver.send_angles(PRESET_JOINTS["NORMAL"], speed=speed), time.sleep(1.5))),
+            ("ACT-01", f"张开自适应夹爪 ({grip_open_val}% 开度)", lambda: (set_gripper_checked(grip_open_val, VisionConfig.GRIPPER_OPEN_SPEED), self._sleep_cancelable(0.4, cancel_token))),
+            ("ACT-02", f"平移至物体上方安全悬停点 ({target_x:.1f}, {target_y:.1f}, {hover_z:.1f})", lambda: (send_coords_checked([target_x, target_y, hover_z, rx0, ry0, rz0], speed_val), self._sleep_cancelable(1.2, cancel_token))),
+            ("ACT-03", f"垂直缓冲下放抓取 ({target_x:.1f}, {target_y:.1f}, {grasp_z:.1f})", lambda: (send_coords_checked([target_x, target_y, grasp_z, rx0, ry0, rz0], down_speed), self._sleep_cancelable(1.2, cancel_token))),
+            ("ACT-04", f"柔性闭合夹爪夹取工件【{target_name}】(开度 {grip_clamp_val}%)", act_04_clamp),
+            ("ACT-05", f"垂直抬升至安全空域高度 ({hover_z:.1f}mm)", lambda: (send_coords_checked([target_x, target_y, hover_z, rx0, ry0, rz0], down_speed), self._sleep_cancelable(1.0, cancel_token))),
+            ("ACT-06", "【空中安全检查点】悬停确认夹持稳定", act_06_check_hold),
+            ("ACT-07", f"经由高位安全航线巡航至目的地 [{dest_display}]", lambda: (move_to_delivery(), self._sleep_cancelable(1.5, cancel_token))),
+            ("ACT-08", "工位就位确认", lambda: self._sleep_cancelable(0.5, cancel_token)),
+            ("ACT-09", f"释放夹爪交付工件 ({grip_open_val}% 开度)", lambda: (set_gripper_checked(grip_open_val, VisionConfig.GRIPPER_OPEN_SPEED), self._sleep_cancelable(0.8, cancel_token))),
+            ("ACT-10", "工件交付确认与安全回退抬升", act_10_retreat),
+            ("ACT-11", "平稳返回初始待机 NORMAL 姿态", lambda: (send_angles_checked(PRESET_JOINTS["NORMAL"], speed_val), self._sleep_cancelable(1.5, cancel_token))),
         ]
 
         total_steps = len(steps)
         for i, (step_id, desc, action) in enumerate(steps):
-            backend = getattr(self.driver, "backend", self.driver)
-            stop_requested = getattr(backend, "stop_requested", None)
-            if stop_requested is not None and stop_requested.is_set():
-                raise RuntimeError("动作已被停止，后续步骤未执行")
+            self._check_cancelled(cancel_token)
             print(f"   [{step_id}] -> {desc}")
             if step_callback:
                 step_callback(step_id, desc, int((i + 1) / total_steps * 100))
             action()
-            time.sleep(0.2)
+            self._sleep_cancelable(0.2, cancel_token)
 
         print(f"🎉 视觉闭环搬运成功！工件【{target_name}】已精准移至工位【{target_station}】。\n")
         return {
@@ -240,120 +374,165 @@ class VisionActionExecutor:
     # --------------------------------------------------------------------------
     # Tool 2: 笛卡尔坐标绝对定位 (Move to Coordinates)
     # --------------------------------------------------------------------------
-    def move_to_coords(self, coords: List[float], speed: int = 15) -> Dict[str, Any]:
+    def move_to_coords(self, coords: List[float], speed: int = 15, cancel_token: Any = None) -> Dict[str, Any]:
         """移动末端至指定笛卡尔坐标 [x, y, z, rx, ry, rz]"""
-        if len(coords) < 3:
-            return {"success": False, "error": "坐标参数不足"}
-        
-        x, y, z = coords[0], coords[1], coords[2]
+        try:
+            speed_val = validate_speed(speed)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        if not isinstance(coords, (list, tuple)) or len(coords) < 3 or not all(is_finite_number(v) for v in coords):
+            return {"success": False, "error": "坐标参数不足或包含非有限数值"}
+        if len(coords) not in (3, 6):
+            return {"success": False, "error": f"坐标维度必须为 3 或 6，当前为 {len(coords)}"}
+
+        x, y, z = float(coords[0]), float(coords[1]), float(coords[2])
         safe_ok, reason = PhysicalSafetyGuard.validate_target_point(x, y, z)
         if not safe_ok:
             return {"success": False, "error": reason}
 
-        # 补全姿态角
-        full_coords = [coords[0], coords[1], coords[2],
-                       coords[3] if len(coords) > 3 else -180.0,
-                       coords[4] if len(coords) > 4 else 0.0,
-                       coords[5] if len(coords) > 5 else 0.0]
-
-        self.driver.send_coords(full_coords, speed)
-        return {"success": True, "target": full_coords}
+        full_coords = [
+            x, y, z,
+            float(coords[3]) if len(coords) == 6 else VisionConfig.DEFAULT_PICK_ORIENTATION[0],
+            float(coords[4]) if len(coords) == 6 else VisionConfig.DEFAULT_PICK_ORIENTATION[1],
+            float(coords[5]) if len(coords) == 6 else VisionConfig.DEFAULT_PICK_ORIENTATION[2],
+        ]
+        clamped = clamp_coords(full_coords, safety_z_min=PRO450_LIMITS["table_safety_z"])
+        self._call_driver_method("send_coords", clamped, speed=speed_val, cancel_token=cancel_token)
+        return {"success": True, "target": clamped}
 
     # --------------------------------------------------------------------------
     # Tool 3: 笛卡尔空间单轴微调点动 (Jog Cartesian Step)
     # --------------------------------------------------------------------------
-    def jog_cartesian(self, axis: str, delta: float, speed: int = 15) -> Dict[str, Any]:
-        """
-        末端沿指定轴增量微调 (+X, -X, +Y, -Y, +Z, -Z, +Rx, etc.)
-        """
-        axis = axis.lower()
-        curr = self.driver.get_coords()
-        if not curr or len(curr) < 6:
-            curr = [180.0, 0.0, 180.0, -180.0, 0.0, 0.0]
+    def jog_cartesian(self, axis: str, delta: float, speed: int = 15, cancel_token: Any = None) -> Dict[str, Any]:
+        """末端沿指定轴增量微调 (+X, -X, +Y, -Y, +Z, -Z, +Rx, etc.)"""
+        if not is_finite_number(delta):
+            return {"success": False, "error": f"步长 delta 必须为有限数字: {delta!r}"}
+        try:
+            speed_val = validate_speed(speed)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        if not isinstance(axis, str):
+            return {"success": False, "error": f"无效轴名: {axis!r}"}
 
-        target = list(curr)
+        axis = axis.strip().lower()
         axis_map = {"x": 0, "y": 1, "z": 2, "rx": 3, "ry": 4, "rz": 5}
         if axis not in axis_map:
             return {"success": False, "error": f"无效轴名: {axis}"}
 
         idx = axis_map[axis]
-        target[idx] += delta
+        delta_val = float(delta)
+        if idx in (0, 1, 2) and abs(delta_val) > PhysicalSafetyGuard.MAX_STEP_XYZ:
+            return {"success": False, "error": f"单步平移增量超限: {abs(delta_val):.1f}mm > {PhysicalSafetyGuard.MAX_STEP_XYZ}mm"}
+        if idx in (3, 4, 5) and abs(delta_val) > PhysicalSafetyGuard.MAX_STEP_ROT:
+            return {"success": False, "error": f"单步旋转增量超限: {abs(delta_val):.1f}deg > {PhysicalSafetyGuard.MAX_STEP_ROT}deg"}
 
-        # 针对位移进行安全审核
-        if idx in [0, 1, 2]:
+        curr, err = self._read_fresh_coords()
+        if curr is None:
+            return {"success": False, "error": err}
+
+        target = list(curr)
+        target[idx] += delta_val
+
+        if idx in (0, 1, 2):
             safe_ok, reason = PhysicalSafetyGuard.validate_target_point(target[0], target[1], target[2])
             if not safe_ok:
                 return {"success": False, "error": reason}
 
-        # 检查是否处于全零奇异姿态，若是则先微动关节脱离奇异点
-        curr_angles = self.driver.get_angles()
+        curr_angles, _ = self._read_fresh_angles()
         if curr_angles and all(abs(a) < 1.0 for a in curr_angles[1:4]):
-            self.driver.send_angles([curr_angles[0], 10.0, -15.0, 5.0, curr_angles[4], curr_angles[5]], speed=20)
-            time.sleep(0.5)
+            self._call_driver_method(
+                "send_angles",
+                [curr_angles[0], 10.0, -15.0, 5.0, curr_angles[4], curr_angles[5]],
+                speed=20,
+                cancel_token=cancel_token,
+            )
+            self._sleep_cancelable(0.5, cancel_token)
 
-        self.driver.send_coords(target, speed)
-        return {"success": True, "new_coords": target}
+        clamped = clamp_coords(target, safety_z_min=PRO450_LIMITS["table_safety_z"])
+        self._call_driver_method("send_coords", clamped, speed=speed_val, cancel_token=cancel_token)
+        return {"success": True, "new_coords": clamped}
 
     # --------------------------------------------------------------------------
     # Tool 4: 关节角度控制与微调点动 (Joints Control & Jog)
     # --------------------------------------------------------------------------
-    def move_joints(self, angles: List[float], speed: int = 15) -> Dict[str, Any]:
+    def move_joints(self, angles: List[float], speed: int = 15, cancel_token: Any = None) -> Dict[str, Any]:
         """驱动机械臂 6 个关节角度"""
-        if len(angles) != 6:
-            return {"success": False, "error": "关节角度数组必须为 6 个"}
-        self.driver.send_angles(angles, speed)
-        return {"success": True, "angles": angles}
+        try:
+            speed_val = validate_speed(speed)
+            clamped = clamp_angles(angles)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+        self._call_driver_method("send_angles", clamped, speed=speed_val, cancel_token=cancel_token)
+        return {"success": True, "angles": clamped}
 
-    def jog_joint(self, joint_idx: int, delta_deg: float, speed: int = 15) -> Dict[str, Any]:
+    def jog_joint(self, joint_idx: int, delta_deg: float, speed: int = 15, cancel_token: Any = None) -> Dict[str, Any]:
         """单关节微调点动 (joint_idx: 1~6)"""
-        if not (1 <= joint_idx <= 6):
+        if isinstance(joint_idx, bool) or not isinstance(joint_idx, int) or not (1 <= joint_idx <= 6):
             return {"success": False, "error": "关节编号必须在 1~6 之间"}
-        
-        curr = self.driver.get_angles()
-        if not curr or len(curr) < 6:
-            curr = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        
+        if not is_finite_number(delta_deg):
+            return {"success": False, "error": f"关节增量必须为有限数字: {delta_deg!r}"}
+        try:
+            speed_val = validate_speed(speed)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        curr, err = self._read_fresh_angles()
+        if curr is None:
+            return {"success": False, "error": err}
+
         target = list(curr)
-        target[joint_idx - 1] += delta_deg
-        # 严格遵守 myCobot Pro 450 单轴极限钳位
+        target[joint_idx - 1] += float(delta_deg)
         target = clamp_angles(target)
 
-        self.driver.send_angles(target, speed)
+        self._call_driver_method("send_angles", target, speed=speed_val, cancel_token=cancel_token)
         return {"success": True, "new_angles": target}
 
     # --------------------------------------------------------------------------
     # Tool 5: 预设标定工位巡航 (Move to Station)
     # --------------------------------------------------------------------------
-    def move_to_station(self, station_name: str, speed: int = 15) -> Dict[str, Any]:
-        """快速巡航至已标定的物理工位 (HOME, P1, P2, P3, P4, SCAN)"""
-        s_name = station_name.upper()
+    def move_to_station(self, station_name: str, speed: int = 15, cancel_token: Any = None) -> Dict[str, Any]:
+        """快速巡航至已标定的物理工位 (HOME, NORMAL, P1..P5, SCAN)"""
+        if not isinstance(station_name, str) or not station_name.strip():
+            return {"success": False, "error": f"无效工位: {station_name!r}"}
+        try:
+            speed_val = validate_speed(speed)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
+        s_name = station_name.strip().upper()
         if s_name not in PRESET_STATIONS and s_name not in PRESET_JOINTS:
             return {"success": False, "error": f"未知工位: {station_name}"}
 
-        # 优先使用关节角度巡航，彻底避免逆运动学奇异点无解错误
         if s_name in PRESET_JOINTS:
             angles = PRESET_JOINTS[s_name]
-            self.driver.send_angles(angles, speed)
+            self._call_driver_method("send_angles", angles, speed=speed_val, cancel_token=cancel_token)
             return {"success": True, "station": s_name, "angles": angles}
 
         coords = PRESET_STATIONS[s_name]
-        self.driver.send_coords(coords, speed)
+        self._call_driver_method("send_coords", coords, speed=speed_val, cancel_token=cancel_token)
         return {"success": True, "station": s_name, "coords": coords}
 
     # --------------------------------------------------------------------------
     # Tool 6: 自适应夹爪连续行程控制 (Continuous Gripper Control)
     # --------------------------------------------------------------------------
-    def control_gripper(self, action: str = "OPEN", value_percent: Optional[int] = None, speed: int = 50) -> Dict[str, Any]:
-        """
-        夹爪控制：支持快速开合 (OPEN/CLOSE) 或 0~100% 连续行程开度
-        """
+    def control_gripper(self, action: str = "OPEN", value_percent: Optional[int] = None, speed: int = 50, cancel_token: Any = None) -> Dict[str, Any]:
+        """夹爪控制：支持快速开合 (OPEN/CLOSE) 或 0~100% 连续行程开度"""
+        try:
+            speed_val = validate_speed(speed)
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
+
         if value_percent is not None:
-            val = max(0, min(100, int(value_percent)))
-            self.driver.set_gripper_value(val, speed)
-            return {"success": True, "mode": "percentage", "value": val}
-        else:
-            self.driver.set_gripper(action, speed)
-            return {"success": True, "mode": "discrete", "action": action.upper()}
+            if not is_finite_number(value_percent) or value_percent < 0 or value_percent > 100:
+                return {"success": False, "error": f"夹爪百分比必须在 [0, 100] 范围内: {value_percent!r}"}
+            val = int(round(float(value_percent)))
+            res = self._call_driver_method("set_gripper_value", val, speed=speed_val, cancel_token=cancel_token)
+            return {"success": True, "mode": "percentage", "value": val, "feedback": res}
+        act = str(action).strip().upper()
+        if act not in ("OPEN", "CLOSE"):
+            return {"success": False, "error": f"无效夹爪动作: {action!r}"}
+        res = self._call_driver_method("set_gripper", act, speed=speed_val, cancel_token=cancel_token)
+        return {"success": True, "mode": "discrete", "action": act, "feedback": res}
 
     # --------------------------------------------------------------------------
     # Tool 7: OpenVLA 7-DoF 动作步进转换执行器 (OpenVLA Step Action)
@@ -363,74 +542,108 @@ class VisionActionExecutor:
         action_7d: List[float],
         scale_xyz_mm: float = 20.0,
         scale_rot_deg: float = 10.0,
-        gripper_threshold: float = 0.5
+        gripper_threshold: float = 0.5,
+        action_spec: str = "normalized_delta",
+        cancel_token: Any = None,
     ) -> Dict[str, Any]:
         """
-        执行 OpenVLA 预测的 7-DoF 归一化动作增量:
-        [dx, dy, dz, droll, dpitch, dyaw, gripper] (范围通常在 -1.0 ~ 1.0)
-        转换为真实物理位移并驱动机械臂
+        执行 OpenVLA 预测的 7-DoF 动作增量 [dx, dy, dz, droll, dpitch, dyaw, gripper]。
+        支持显式 action_spec:
+          - 'normalized_delta': 模型输出 [-1, 1]，按 scale_xyz_mm / scale_rot_deg 映射为物理 mm/deg；
+          - 'bridge_unnormalized' / 'metric_delta': 模型输出物理 m 与 rad，换算为 mm (*1000) 与 deg (*180/pi)。
+        同时对平移与旋转均执行限幅与校验，并核验当前实时位姿。
         """
-        if len(action_7d) < 7:
-            return {"success": False, "error": f"OpenVLA 动作维度不足 7: {len(action_7d)}"}
+        if not isinstance(action_7d, (list, tuple)) or len(action_7d) < 7:
+            return {"success": False, "error": f"OpenVLA 动作维度不足 7: {len(action_7d) if isinstance(action_7d, (list, tuple)) else type(action_7d).__name__}"}
+        if not all(is_finite_number(v) for v in action_7d[:7]):
+            return {"success": False, "error": f"OpenVLA 动作包含非有限值或非法类型: {action_7d[:7]!r}"}
+        if not (is_finite_number(scale_xyz_mm) and scale_xyz_mm > 0 and is_finite_number(scale_rot_deg) and scale_rot_deg > 0):
+            return {"success": False, "error": "scale_xyz_mm 与 scale_rot_deg 必须为正有限数"}
 
-        raw_dx, raw_dy, raw_dz = action_7d[0], action_7d[1], action_7d[2]
-        raw_drx, raw_dry, raw_drz = action_7d[3], action_7d[4], action_7d[5]
-        raw_grip = action_7d[6]
+        raw_dx, raw_dy, raw_dz = [float(v) for v in action_7d[:3]]
+        raw_drx, raw_dry, raw_drz = [float(v) for v in action_7d[3:6]]
+        raw_grip = float(action_7d[6])
 
-        # 换算到真实空间物理量
-        dx = raw_dx * scale_xyz_mm
-        dy = raw_dy * scale_xyz_mm
-        dz = raw_dz * scale_xyz_mm
-        drx = raw_drx * scale_rot_deg
-        dry = raw_dry * scale_rot_deg
-        drz = raw_drz * scale_rot_deg
+        spec = str(action_spec or "normalized_delta").strip().lower()
+        if spec in ("bridge_unnormalized", "metric_delta", "meters_radians"):
+            dx, dy, dz = raw_dx * 1000.0, raw_dy * 1000.0, raw_dz * 1000.0
+            drx = math.degrees(raw_drx)
+            dry = math.degrees(raw_dry)
+            drz = math.degrees(raw_drz)
+        elif spec == "normalized_delta":
+            dx = raw_dx * float(scale_xyz_mm)
+            dy = raw_dy * float(scale_xyz_mm)
+            dz = raw_dz * float(scale_xyz_mm)
+            drx = raw_drx * float(scale_rot_deg)
+            dry = raw_dry * float(scale_rot_deg)
+            drz = raw_drz * float(scale_rot_deg)
+        else:
+            return {"success": False, "error": f"未知 action_spec: {action_spec!r}"}
 
-        # 安全限幅
+        # 同时对平移与旋转执行等比限幅保护
         safe_delta, reason = PhysicalSafetyGuard.validate_delta_step(dx, dy, dz, drx, dry, drz)
+        clamped_by_guard = False
         if not safe_delta:
             print(f"⚠️ OpenVLA 动作限幅告警: {reason}")
-            # 自动等比缩放到安全阈值
-            norm = math.sqrt(dx**2 + dy**2 + dz**2)
-            if norm > PhysicalSafetyGuard.MAX_STEP_XYZ:
-                scale = PhysicalSafetyGuard.MAX_STEP_XYZ / norm
-                dx *= scale
-                dy *= scale
-                dz *= scale
+            clamped_by_guard = True
+            norm_xyz = math.sqrt(dx**2 + dy**2 + dz**2)
+            if norm_xyz > PhysicalSafetyGuard.MAX_STEP_XYZ:
+                s_xyz = PhysicalSafetyGuard.MAX_STEP_XYZ / norm_xyz
+                dx *= s_xyz
+                dy *= s_xyz
+                dz *= s_xyz
+            max_rot = max(abs(drx), abs(dry), abs(drz))
+            if max_rot > PhysicalSafetyGuard.MAX_STEP_ROT:
+                s_rot = PhysicalSafetyGuard.MAX_STEP_ROT / max_rot
+                drx *= s_rot
+                dry *= s_rot
+                drz *= s_rot
 
-        # 获取当前坐标并施加增量
-        curr = self.driver.get_coords()
-        if not curr or len(curr) < 6:
-            curr = [180.0, 0.0, 180.0, -180.0, 0.0, 0.0]
+            ok_after, err_after = PhysicalSafetyGuard.validate_delta_step(dx, dy, dz, drx, dry, drz)
+            if not ok_after:
+                return {"success": False, "error": f"OpenVLA 限幅后仍不安全: {err_after}"}
+
+        curr, err = self._read_fresh_coords()
+        if curr is None:
+            return {"success": False, "error": err}
 
         target_xyz = [curr[0] + dx, curr[1] + dy, curr[2] + dz]
         safe_pt, pt_reason = PhysicalSafetyGuard.validate_target_point(*target_xyz)
         if not safe_pt:
             return {"success": False, "error": f"OpenVLA 目标点越界: {pt_reason}"}
 
-        target_coords = [
-            target_xyz[0], target_xyz[1], target_xyz[2],
-            curr[3] + drx, curr[4] + dry, curr[5] + drz
-        ]
-        self.driver.send_coords(target_coords, speed=15)
+        def _wrap_deg(a: float) -> float:
+            return ((a + 180.0) % 360.0) - 180.0
 
-        # 夹爪动作
+        target_coords = clamp_coords([
+            target_xyz[0],
+            target_xyz[1],
+            target_xyz[2],
+            _wrap_deg(curr[3] + drx),
+            max(-180.0, min(180.0, curr[4] + dry)),
+            _wrap_deg(curr[5] + drz),
+        ], safety_z_min=PRO450_LIMITS["table_safety_z"])
+
+        self._call_driver_method("send_coords", target_coords, speed=15, cancel_token=cancel_token)
+
         gripper_state = "CLOSE" if raw_grip < gripper_threshold else "OPEN"
-        self.driver.set_gripper(gripper_state, speed=60)
+        grip_res = self._call_driver_method("set_gripper", gripper_state, speed=60, cancel_token=cancel_token)
 
         return {
             "success": True,
-            "applied_delta": [dx, dy, dz, drx, dry, drz],
+            "action_spec": spec,
+            "clamped": clamped_by_guard,
+            "applied_delta": [round(dx, 2), round(dy, 2), round(dz, 2), round(drx, 2), round(dry, 2), round(drz, 2)],
             "new_coords": target_coords,
-            "gripper": gripper_state
+            "gripper": gripper_state,
+            "gripper_feedback": grip_res,
         }
 
     # --------------------------------------------------------------------------
     # Tool 8: 多视点环视全景巡检扫描 (Panoramic Workspace Scan)
     # --------------------------------------------------------------------------
-    def scan_workspace(self, scan_callback: Optional[callable] = None) -> Dict[str, Any]:
-        """
-        机械臂执行预定三维巡检航线，在关键视角悬停扫描 (采用关节角度驱动，彻底避免逆解奇点报错)
-        """
+    def scan_workspace(self, scan_callback: Optional[callable] = None, cancel_token: Any = None) -> Dict[str, Any]:
+        """机械臂执行预定三维巡检航线，支持取消令牌中断与真实反馈检查。"""
         self.set_status_led("MOVING")
         scan_waypoints = [
             ("SCAN-P1",     PRESET_JOINTS["P1"],     "工位 P1 俯视视点 (左侧工位 X:296 Y:207)"),
@@ -441,19 +654,20 @@ class VisionActionExecutor:
         results = []
         total = len(scan_waypoints)
         for i, (code, angles, desc) in enumerate(scan_waypoints):
+            self._check_cancelled(cancel_token)
             print(f"🔍 巡检航点 [{i+1}/{total}]: {desc} -> 关节角度 {angles}")
-            self.driver.send_angles(angles, speed=18)
-            time.sleep(1.2)
-            coords = self.driver.get_coords()
+            self._call_driver_method("send_angles", angles, speed=18, cancel_token=cancel_token)
+            self._sleep_cancelable(1.2, cancel_token)
+            coords, _ = self._read_fresh_coords()
             pct = int(((i + 1) / (total + 1)) * 100)
             if scan_callback:
                 scan_callback(code, desc, pct)
             results.append({"code": code, "desc": desc, "angles": angles, "coords": coords})
 
-        # 巡检完毕返回待机工位 HOME
+        self._check_cancelled(cancel_token)
         print("🔄 巡检扫描完毕，机械臂平稳返回待机工位 HOME...")
-        self.move_to_station("HOME", speed=18)
-        time.sleep(1.0)
+        self.move_to_station("HOME", speed=18, cancel_token=cancel_token)
+        self._sleep_cancelable(1.0, cancel_token)
         self.set_status_led("IDLE")
         if scan_callback:
             scan_callback("SCAN-DONE", "全景三维巡检扫描已圆满完成", 100)

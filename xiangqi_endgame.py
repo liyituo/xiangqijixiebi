@@ -15,7 +15,13 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Any
 
 from env_loader import get_vlm_api_key
-from xiangqi_engine import XiangqiBoard, PikafishEngine
+from xiangqi_engine import (
+    XiangqiBoard,
+    PikafishEngine,
+    is_valid_square,
+    square_to_coord,
+    VALID_PIECE_CHARS,
+)
 from xiangqi_agent import XiangqiGridMapper
 
 API_KEY = get_vlm_api_key("VLM_API_KEY", "DEEPSEEK_API_KEY")
@@ -69,23 +75,31 @@ def build_fen_from_pieces(pieces_dict: Dict[str, str], turn: str = "w") -> str:
 
 def detect_endgame_from_image(frame: np.ndarray, grid_mapper: Optional[XiangqiGridMapper] = None) -> Dict[str, Any]:
     """
-    自动对当前相机画面进行残局检测与棋子定位
+    自动对当前相机画面进行残局检测与棋子定位。
+    绝不使用固定 8 子示例残局静默回退；任何识别/网络/校验失败均明确返回错误。
     """
+    if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0:
+        return {"success": False, "error": "输入图像为空或无效", "error_type": "invalid_input"}
+
+    if not API_KEY:
+        return {"success": False, "error": "未配置视觉识别 API Key (VLM_API_KEY)", "error_type": "config_missing"}
+
     if grid_mapper is None:
         grid_mapper = XiangqiGridMapper()
 
     h, w = frame.shape[:2]
 
-    # 1. 裁剪棋盘核心有效区域并画上网格十字标
+    # 1. 在棋盘交叉点画上网格十字标
     disp = frame.copy()
     for r in range(10):
         for c in "abcdefghi":
             pt = grid_mapper.get_square_pixel_pos(f"{c}{r}", w, h)
             cv2.circle(disp, pt, 3, (0, 255, 0), -1)
-            cv2.putText(disp, f"{c}{r}", (pt[0]-8, pt[1]-5), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
+            cv2.putText(disp, f"{c}{r}", (pt[0] - 8, pt[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
 
-    # 编码为 JPEG
     ret, buf = cv2.imencode(".jpg", disp, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    if not ret:
+        return {"success": False, "error": "图像 JPEG 编码失败", "error_type": "encode_error"}
     b64 = base64.b64encode(buf).decode("utf-8")
 
     prompt = (
@@ -102,13 +116,7 @@ def detect_endgame_from_image(frame: np.ndarray, grid_mapper: Optional[XiangqiGr
         "{\n"
         '  "pieces": [\n'
         '    {"square": "d9", "piece": "K", "name": "红帅"},\n'
-        '    {"square": "h8", "piece": "C", "name": "红炮"},\n'
-        '    {"square": "b3", "piece": "P", "name": "红兵"},\n'
-        '    {"square": "e3", "piece": "c", "name": "黑炮"},\n'
-        '    {"square": "b1", "piece": "N", "name": "红马"},\n'
-        '    {"square": "e1", "piece": "a", "name": "黑士"},\n'
-        '    {"square": "e0", "piece": "k", "name": "黑将"},\n'
-        '    {"square": "h1", "piece": "P", "name": "红兵"}\n'
+        '    {"square": "e0", "piece": "k", "name": "黑将"}\n'
         "  ],\n"
         '  "turn": "r"\n'
         "}\n"
@@ -127,7 +135,6 @@ def detect_endgame_from_image(frame: np.ndarray, grid_mapper: Optional[XiangqiGr
         "temperature": 0.1
     }
 
-    t0 = time.time()
     try:
         resp = requests.post(
             API_URL,
@@ -135,55 +142,76 @@ def detect_endgame_from_image(frame: np.ndarray, grid_mapper: Optional[XiangqiGr
             json=payload,
             timeout=25.0
         )
-        elapsed = time.time() - t0
+        if resp.status_code != 200:
+            return {
+                "success": False,
+                "error": f"VLM 接口返回 HTTP {resp.status_code}",
+                "error_type": "vlm_http_error",
+            }
         content = resp.json()["choices"][0]["message"].get("content", "")
         from vision_tools import _extract_vlm_json
         parsed = _extract_vlm_json(content)
+    except requests.Timeout as e:
+        return {"success": False, "error": f"视觉识别超时: {e}", "error_type": "vlm_timeout"}
     except Exception as e:
-        print(f"❌ 大模型识别异常: {e}")
-        parsed = None
+        return {"success": False, "error": f"视觉识别异常: {e}", "error_type": "vlm_error"}
 
-    # 如果模型识别失败或网络超时，基于当前实际实测物理棋子回退
-    if not parsed or "pieces" not in parsed or not parsed["pieces"]:
-        parsed = {
-            "pieces": [
-                {"square": "d9", "piece": "K", "name": "红帅"},
-                {"square": "h8", "piece": "C", "name": "红炮"},
-                {"square": "b3", "piece": "P", "name": "红兵"},
-                {"square": "e3", "piece": "c", "name": "黑炮"},
-                {"square": "b1", "piece": "N", "name": "红马"},
-                {"square": "e1", "piece": "a", "name": "黑士"},
-                {"square": "e0", "piece": "k", "name": "黑将"},
-                {"square": "h1", "piece": "P", "name": "红兵"},
-            ],
-            "turn": "r"
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("pieces"), list) or len(parsed["pieces"]) == 0:
+        return {
+            "success": False,
+            "error": "视觉模型未识别出有效残局棋子列表，请调整光照或重试识别",
+            "error_type": "empty_or_invalid_json",
         }
 
     raw_pieces = parsed["pieces"]
-    piece_dict = {}
-    for item in raw_pieces:
-        sq = item.get("square", "").lower()
-        p = item.get("piece", "")
-        if sq and p:
-            piece_dict[sq] = p
+    piece_dict: Dict[str, str] = {}
+    for idx, item in enumerate(raw_pieces):
+        if not isinstance(item, dict):
+            return {"success": False, "error": f"第 {idx} 项格式无效", "error_type": "validation_error"}
+        sq = str(item.get("square", "")).strip().lower()
+        if not is_valid_square(sq):
+            return {"success": False, "error": f"检测到非法棋盘坐标: {sq!r}", "error_type": "validation_error"}
+        p = str(item.get("piece", "")).strip()
+        if p not in VALID_PIECE_CHARS:
+            name = str(item.get("name", "")).strip()
+            p = PIECE_MAP_CN.get(name, "")
+        if p not in VALID_PIECE_CHARS:
+            return {"success": False, "error": f"格子 {sq} 包含未知棋子类型: {item!r}", "error_type": "validation_error"}
+        if sq in piece_dict:
+            return {"success": False, "error": f"检测到重复占格坐标: {sq}", "error_type": "duplicate_square"}
+        piece_dict[sq] = p
 
-    # 检查红帅位置：如果红帅在 d9/e9 (顶部九宫)，说明物理摆棋为红方在顶，黑将在此
-    # 标准象棋 FEN 要求红方底线在 rank 0，黑方在 rank 9
-    # 因此若红帅在 rank 7..9，自动进行视角 180 度翻转适配 Pikafish 标准引擎
-    is_rotated = False
-    red_king_sq = None
-    for sq, p in piece_dict.items():
-        if p == "K":
-            red_king_sq = sq
-            break
+    red_kings = [sq for sq, p in piece_dict.items() if p == "K"]
+    black_kings = [sq for sq, p in piece_dict.items() if p == "k"]
+    if len(red_kings) != 1 or len(black_kings) != 1:
+        return {
+            "success": False,
+            "error": f"残局局面将帅数量非法 (红帅={len(red_kings)}, 黑将={len(black_kings)})",
+            "error_type": "invalid_kings",
+        }
 
-    if red_king_sq and int(red_king_sq[1]) >= 5:
-        is_rotated = True
+    red_king_sq = red_kings[0]
+    is_rotated = int(red_king_sq[1]) >= 5
+    if is_rotated:
         std_pieces = {rotate_square_180(sq): p for sq, p in piece_dict.items()}
     else:
-        std_pieces = piece_dict.copy()
+        std_pieces = dict(piece_dict)
 
-    fen = build_fen_from_pieces(std_pieces, turn="w")
+    # 校验兵/卒基本半区合理性 (未过河前不可退居己方底线2行内)
+    for sq, p in std_pieces.items():
+        _, r = square_to_coord(sq)
+        if p == "P" and r < 3:
+            return {"success": False, "error": f"红兵位置非法(处于己方后方): {sq}", "error_type": "invalid_pawn"}
+        if p == "p" and r > 6:
+            return {"success": False, "error": f"黑卒位置非法(处于己方后方): {sq}", "error_type": "invalid_pawn"}
+
+    raw_turn = str(parsed.get("turn", "r")).strip().lower()
+    fen_turn = "b" if raw_turn in ("b", "black", "黑") else "w"
+    fen = build_fen_from_pieces(std_pieces, turn=fen_turn)
+    ok_fen, fen_err = XiangqiBoard.validate_fen(fen)
+    if not ok_fen:
+        return {"success": False, "error": f"识别局面不符合象棋规则: {fen_err}", "error_type": "invalid_fen"}
+
     print(f"🎯 残局识别完成: 共 {len(piece_dict)} 颗棋子, 旋转对齐: {is_rotated}, 标准FEN: {fen}")
 
     return {

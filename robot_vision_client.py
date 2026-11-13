@@ -16,10 +16,10 @@ import threading
 import cv2
 import requests
 import numpy as np
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 from vision_calibration import HandEyeMapper
-from vision_tools import VisionActionExecutor, PhysicalSafetyGuard
+from vision_tools import VisionActionExecutor, PhysicalSafetyGuard, PRESET_JOINTS
 from pro450_driver import MyCobotPro450Driver, is_valid_vector, clamp_angles, clamp_coords
 
 # 云服务器多模态 API 接口 (通过 SSH 隧道映射到本地 6006 端口)
@@ -93,35 +93,102 @@ class EnhancedRobotDriver:
 
 
 class CameraStreamThread:
-    """常驻后台的低延迟视频流捕获器"""
+    """常驻后台的低延迟视频流捕获器 (带帧序号、时间戳、断流计次与可用性状态)"""
 
     def __init__(self, cam_id: int = 0):
+        self.cam_id = cam_id
         self.cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.current_frame = None
+        if self.cap is not None and self.cap.isOpened():
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            self.last_error: Optional[str] = None
+        else:
+            self.last_error = f"无法打开摄像头 (cam_id={cam_id})"
+        self.current_frame: Optional[np.ndarray] = None
+        self.frame_id: int = 0
+        self.frame_timestamp: float = 0.0
+        self.consecutive_failures: int = 0
+        self.is_available: bool = False
         self.is_running = True
         self.lock = threading.Lock()
-        
-        # 启动多线程连续读取
-        self.thread = threading.Thread(target=self._update_loop, daemon=True)
+
+        self.thread = threading.Thread(target=self._update_loop, daemon=True, name="CameraStream")
         self.thread.start()
 
     def _update_loop(self):
         while self.is_running:
-            ret, frame = self.cap.read()
-            if ret and frame is not None:
+            cap = self.cap
+            if cap is None or not cap.isOpened():
                 with self.lock:
+                    self.consecutive_failures += 1
+                    self.is_available = False
+                    self.last_error = "摄像头未打开或已断开"
+                time.sleep(0.1)
+                continue
+            try:
+                ret, frame = cap.read()
+            except Exception as e:
+                ret, frame = False, None
+                err = str(e)
+            else:
+                err = "摄像头读取空帧"
+            now = time.time()
+            with self.lock:
+                if ret and frame is not None and frame.size > 0:
                     self.current_frame = frame
-            time.sleep(0.01)
+                    self.frame_id += 1
+                    self.frame_timestamp = now
+                    self.consecutive_failures = 0
+                    self.is_available = True
+                    self.last_error = None
+                else:
+                    self.consecutive_failures += 1
+                    self.last_error = err
+                    if self.consecutive_failures >= 10:
+                        self.is_available = False
+            time.sleep(0.01 if ret else 0.05)
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
         with self.lock:
             return self.current_frame.copy() if self.current_frame is not None else None
 
+    def get_latest_frame_with_meta(self, max_age_s: float = 2.0) -> Tuple[Optional[np.ndarray], Dict[str, Any]]:
+        """原子获取最新帧拷贝及其新鲜度/状态元数据。"""
+        now = time.time()
+        with self.lock:
+            frame = self.current_frame.copy() if self.current_frame is not None else None
+            ts = self.frame_timestamp
+            age_s = round(max(0.0, now - ts), 3) if ts > 0 else None
+            fresh = bool(
+                frame is not None
+                and self.is_available
+                and age_s is not None
+                and age_s <= max_age_s
+                and self.consecutive_failures < 10
+            )
+            h, w = frame.shape[:2] if frame is not None else (0, 0)
+            meta = {
+                "frame_id": self.frame_id,
+                "timestamp": ts,
+                "age_s": age_s,
+                "fresh": fresh,
+                "available": self.is_available,
+                "consecutive_failures": self.consecutive_failures,
+                "last_error": self.last_error,
+                "width": int(w),
+                "height": int(h),
+            }
+            return frame, meta
+
     def release(self):
         self.is_running = False
-        self.cap.release()
+        if self.thread and self.thread.is_alive() and threading.current_thread() is not self.thread:
+            self.thread.join(timeout=2.0)
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
 
 
 def frame_to_base64_optimized(frame: np.ndarray, max_dim: Optional[int] = None, quality: int = 98) -> str:
@@ -270,14 +337,19 @@ def main():
                     res = executor.execute_visual_pick_and_place(target_obj, bbox, station)
                     hud_state["status"] = "Pick & Place Success!" if res.get("success") else "Task failed!"
 
+                elif tool_name == "openvla_step":
+                    action_vec = args.get("action_7d") or args.get("action") or []
+                    action_spec = args.get("action_spec", "normalized_delta")
+                    res = executor.execute_openvla_action_step(action_vec, action_spec=action_spec)
+                    hud_state["status"] = "OpenVLA Step Done" if res.get("success") else f"OpenVLA Blocked: {res.get('error')}"
                 elif tool_name == "reset_arm":
-                    driver.send_angles([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], speed=15)
-                    hud_state["status"] = "Arm reset Home."
+                    driver.send_angles(PRESET_JOINTS["NORMAL"], speed=15)
+                    hud_state["status"] = "Arm reset NORMAL."
                 elif tool_name == "wave_hand":
                     print("👋 挥手动作中...")
                     driver.send_angles([0.0, 20.0, -20.0, 0.0, 30.0, 0.0], 20)
                     driver.send_angles([0.0, 20.0, -20.0, 0.0, -30.0, 0.0], 20)
-                    driver.send_angles([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 15)
+                    driver.send_angles(PRESET_JOINTS["NORMAL"], 15)
                     hud_state["status"] = "Wave done."
                 elif tool_name == "flexarm_control_gripper":
                     driver.set_gripper(args.get("action", "OPEN"))

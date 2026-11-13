@@ -15,12 +15,24 @@ sys_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if sys_path not in sys.path:
     sys.path.insert(0, sys_path)
 
-from robot_controller import RobotController, HardwareCommunicationError, SafetyViolationError
-from task_manager import TaskManager, ActionType, ActionStatus
-from execution_monitor import ExecutionMonitor
-from replanner import MinimumCostReplanner
-from instruction_validator import InstructionValidator
-from cost_model import PlanCostEvaluator
+_PARENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PARENT_DIR not in sys.path:
+    sys.path.insert(0, _PARENT_DIR)
+
+try:
+    from .robot_controller import RobotController, HardwareCommunicationError, SafetyViolationError
+    from .task_manager import TaskManager, ActionType, ActionStatus
+    from .execution_monitor import ExecutionMonitor
+    from .replanner import MinimumCostReplanner
+    from .instruction_validator import InstructionValidator
+    from .cost_model import PlanCostEvaluator
+except ImportError:
+    from robot_controller import RobotController, HardwareCommunicationError, SafetyViolationError
+    from task_manager import TaskManager, ActionType, ActionStatus
+    from execution_monitor import ExecutionMonitor
+    from replanner import MinimumCostReplanner
+    from instruction_validator import InstructionValidator
+    from cost_model import PlanCostEvaluator
 
 
 class FlexArmToolkit:
@@ -36,7 +48,11 @@ class FlexArmToolkit:
         auto_connect: bool = True
     ):
         self.simulation = simulation
-        self.config_path = os.path.abspath(station_config_path)
+        if os.path.exists(station_config_path):
+            self.config_path = os.path.abspath(station_config_path)
+        else:
+            pkg_cfg = os.path.join(os.path.dirname(os.path.abspath(__file__)), station_config_path)
+            self.config_path = pkg_cfg if os.path.exists(pkg_cfg) else os.path.abspath(station_config_path)
 
         # 1. 硬件控制层
         self.controller = RobotController(

@@ -11,12 +11,15 @@ FlexArm x OpenVLA-7B 具身智能动作生成服务 (OpenVLA Serving API)
 import os
 import sys
 import time
+import math
+import hmac
 import base64
 import torch
 import numpy as np
 from io import BytesIO
 from PIL import Image
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
@@ -36,11 +39,22 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", "http://127.0.0.1:5000,http://localhost:5000").split(",") if o.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-Robot-Token"],
 )
+
+
+@app.middleware("http")
+async def _verify_api_token(request: Request, call_next):
+    expected = os.environ.get("ROBOT_API_TOKEN", "").strip()
+    if expected and request.url.path not in ("/health", "/docs", "/openapi.json"):
+        auth_hdr = request.headers.get("Authorization", "")
+        token = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else request.headers.get("X-Robot-Token", "").strip()
+        if not token or not hmac.compare_digest(token, expected):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 # 全局模型与处理器单例
 processor = None
@@ -140,11 +154,15 @@ def predict_action_endpoint(req: PredictActionRequest):
 
         elapsed_ms = (time.time() - t0) * 1000.0
         action_list = [float(x) for x in action.tolist()]
+        if len(action_list) < 7 or not all(math.isfinite(x) for x in action_list[:7]):
+            raise ValueError(f"OpenVLA 模型输出包含非法或非有限动作向量: {action_list!r}")
 
         return {
             "success": True,
             "instruction": req.instruction,
             "action_7d": action_list,
+            "action_spec": "bridge_unnormalized",
+            "units": {"translation": "meters", "rotation": "radians", "gripper": "open_0_to_1"},
             "elapsed_ms": round(elapsed_ms, 1)
         }
     except Exception as e:
@@ -178,16 +196,19 @@ def robot_vision_command_endpoint(req: VisionCommandRequest):
 
         elapsed_ms = (time.time() - t0) * 1000.0
         action_list = [float(x) for x in action.tolist()]
+        if len(action_list) < 7 or not all(math.isfinite(x) for x in action_list[:7]):
+            raise ValueError(f"OpenVLA 模型输出包含非有限值: {action_list!r}")
 
         return {
             "has_tool_call": True,
             "tool_name": "openvla_step",
             "arguments": {
                 "action_7d": action_list,
+                "action_spec": "bridge_unnormalized",
                 "instruction": req.instruction
             },
             "elapsed_ms": round(elapsed_ms, 1),
-            "visual_description": f"OpenVLA 预测动作: dXYZ=[{action_list[0]:.2f}, {action_list[1]:.2f}, {action_list[2]:.2f}] 夹爪={action_list[6]:.2f}"
+            "visual_description": f"OpenVLA 预测动作: dXYZ=[{action_list[0]:.3f}m, {action_list[1]:.3f}m, {action_list[2]:.3f}m] 夹爪={action_list[6]:.2f}"
         }
     except Exception as e:
         return {
@@ -199,7 +220,9 @@ def robot_vision_command_endpoint(req: VisionCommandRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    host = os.environ.get("API_HOST", "127.0.0.1")
+    port = int(os.environ.get("API_PORT", "6006"))
     print("=" * 60)
-    print("  🚀 启动 OpenVLA-7B 具身控制服务 (Port: 6006)")
+    print(f"  🚀 启动 OpenVLA-7B 具身控制服务 ({host}:{port})")
     print("=" * 60)
-    uvicorn.run(app, host="0.0.0.0", port=6006, log_level="info")
+    uvicorn.run(app, host=host, port=port, log_level="info")

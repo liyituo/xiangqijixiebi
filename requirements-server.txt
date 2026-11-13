@@ -1,0 +1,10 @@
+# 云端 GPU 推理服务端依赖（用于 app_robot_api.py / app_robot_vlm_api.py / app_openvla_api.py / app_deepseek_vlm_service.py）
+fastapi>=0.110.0
+uvicorn>=0.27.0
+pydantic>=2.0.0
+torch>=2.1.0
+transformers>=4.45.0
+pillow>=10.0.0
+numpy>=1.24.0
+requests>=2.28.0
+qwen-vl-utils>=0.0.8

@@ -6,8 +6,10 @@ import re
 import torch
 import base64
 from io import BytesIO
+import hmac
 from PIL import Image
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, Dict, Any, List
@@ -23,11 +25,22 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ORIGINS", "http://127.0.0.1:5000,http://localhost:5000").split(",") if o.strip()],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-Robot-Token"],
 )
+
+
+@app.middleware("http")
+async def _verify_api_token(request: Request, call_next):
+    expected = os.environ.get("ROBOT_API_TOKEN", "").strip()
+    if expected and request.url.path not in ("/health", "/docs", "/openapi.json"):
+        auth_hdr = request.headers.get("Authorization", "")
+        token = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else request.headers.get("X-Robot-Token", "").strip()
+        if not token or not hmac.compare_digest(token, expected):
+            return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 MODEL_PATH = "/root/autodl-tmp/Qwen2.5-VL-7B-Instruct"
 
@@ -227,4 +240,6 @@ def handle_text_command(req: VisionCommandRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=6006)
+    host = os.environ.get("API_HOST", "127.0.0.1")
+    port = int(os.environ.get("API_PORT", "6006"))
+    uvicorn.run(app, host=host, port=port)

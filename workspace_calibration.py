@@ -15,6 +15,8 @@ import requests
 import numpy as np
 import cv2
 
+from json_store import read_json
+
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "calibration_config.json")
 SNAPSHOT_FILE = os.path.join(os.path.dirname(__file__), "current_table_snapshot.jpg")
 
@@ -32,13 +34,18 @@ class ShrunkWorkspaceMapper:
 
     def load_config(self):
         if os.path.exists(self.config_path):
-            with open(self.config_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data, err = read_json(self.config_path)
+            if err is not None or not isinstance(data, dict):
+                raise RuntimeError(f"标定配置读取失败: {err}")
             self.image_pts = np.array(data["image_points"], dtype=np.float32)
             self.robot_pts = np.array(data["robot_points"], dtype=np.float32)
             self.table_z = float(data.get("table_z_mm", 189.0))
-            self.matrix_img2rob, _ = cv2.findHomography(self.image_pts, self.robot_pts)
-            self.matrix_rob2img, _ = cv2.findHomography(self.robot_pts, self.image_pts)
+            if isinstance(data.get("homography_matrix"), (list, tuple)):
+                self.matrix_img2rob = np.array(data["homography_matrix"], dtype=np.float64)
+                self.matrix_rob2img = np.linalg.inv(self.matrix_img2rob)
+            else:
+                self.matrix_img2rob, _ = cv2.findHomography(self.image_pts, self.robot_pts)
+                self.matrix_rob2img, _ = cv2.findHomography(self.robot_pts, self.image_pts)
             print("✅ 缩小工作台四点映射矩阵构建成功！")
 
     def pixel_to_robot(self, norm_x: float, norm_y: float) -> tuple:
