@@ -1,0 +1,26 @@
+# Python caches & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+
+# Local secrets & API keys (never commit)
+.env
+.env.*
+!.env.example
+本地凭据留档_勿提交.md
+
+# SSH tunnel scripts containing remote host/port/password (never commit)
+1_启动SSH隧道.bat
+ssh_tunnel_daemon.py
+check_remote.py
+monitor_download.py
+
+# Runtime logs, temp captures & stray files
+*.log
+127.0.0.1
+captured_images/
+.DS_Store
+Thumbs.db

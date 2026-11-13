@@ -1,0 +1,203 @@
+{
+  "total": 9,
+  "waypoints": [
+    {
+      "index": 1,
+      "name": "p1",
+      "timestamp": "21:12:46",
+      "joint_angles_deg": [
+        52.13,
+        -10.47,
+        -136.89,
+        59.18,
+        11.37,
+        -139.83
+      ],
+      "cartesian_coords_mm": [
+        196.1,
+        132.2,
+        185.7,
+        -174.0,
+        -9.85,
+        101.63
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 2,
+      "name": "拍",
+      "timestamp": "21:13:54",
+      "joint_angles_deg": [
+        30.36,
+        -46.42,
+        -81.69,
+        39.18,
+        17.71,
+        -139.83
+      ],
+      "cartesian_coords_mm": [
+        348.5,
+        126.2,
+        172.0,
+        -169.17,
+        -14.14,
+        79.02
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 3,
+      "name": "P3",
+      "timestamp": "21:14:26",
+      "joint_angles_deg": [
+        22.44,
+        -90.53,
+        -2.2,
+        20.78,
+        17.71,
+        -139.83
+      ],
+      "cartesian_coords_mm": [
+        453.3,
+        114.4,
+        175.9,
+        176.82,
+        -24.89,
+        75.81
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 4,
+      "name": "P4",
+      "timestamp": "21:15:16",
+      "joint_angles_deg": [
+        9.33,
+        -1.76,
+        -145.21,
+        53.98,
+        13.93,
+        -139.83
+      ],
+      "cartesian_coords_mm": [
+        202.6,
+        -38.7,
+        181.8,
+        -168.61,
+        -8.63,
+        57.94
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 5,
+      "name": "P5",
+      "timestamp": "21:16:29",
+      "joint_angles_deg": [
+        5.95,
+        -37.69,
+        -98.93,
+        47.87,
+        13.93,
+        -139.83
+      ],
+      "cartesian_coords_mm": [
+        332.6,
+        -36.8,
+        170.7,
+        -171.86,
+        -11.42,
+        55.12
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 6,
+      "name": "P6",
+      "timestamp": "21:17:15",
+      "joint_angles_deg": [
+        5.78,
+        -81.5,
+        -16.55,
+        20.88,
+        12.01,
+        -139.85
+      ],
+      "cartesian_coords_mm": [
+        461.9,
+        -26.6,
+        176.8,
+        177.66,
+        -17.35,
+        57.34
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 7,
+      "name": "P7",
+      "timestamp": "21:18:00",
+      "joint_angles_deg": [
+        -13.69,
+        -95.35,
+        1.1,
+        28.32,
+        12.02,
+        -139.85
+      ],
+      "cartesian_coords_mm": [
+        433.6,
+        -180.8,
+        166.5,
+        168.03,
+        -24.11,
+        41.29
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 8,
+      "name": "P8",
+      "timestamp": "21:18:57",
+      "joint_angles_deg": [
+        -18.1,
+        -48.1,
+        -79.5,
+        42.49,
+        10.3,
+        -139.85
+      ],
+      "cartesian_coords_mm": [
+        330.9,
+        -186.9,
+        174.2,
+        -177.08,
+        -11.02,
+        31.9
+      ],
+      "gripper_percent": 1
+    },
+    {
+      "index": 9,
+      "name": "P9",
+      "timestamp": "21:19:42",
+      "joint_angles_deg": [
+        -27.63,
+        -22.56,
+        -119.71,
+        50.97,
+        8.19,
+        -139.86
+      ],
+      "cartesian_coords_mm": [
+        203.9,
+        -193.6,
+        178.0,
+        -173.7,
+        -5.4,
+        21.83
+      ],
+      "gripper_percent": 1
+    }
+  ]
+}

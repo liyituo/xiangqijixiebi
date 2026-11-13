@@ -1,0 +1,13 @@
+@echo off
+chcp 65001 >nul
+title 安装机械臂视觉控制所需依赖
+echo ========================================================
+echo   正在自动安装客户端所需依赖 (通过国内高速镜像源)...
+echo   包含: requests, opencv-python, pymycobot, numpy, flask
+echo ========================================================
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple requests opencv-python pymycobot numpy flask
+echo.
+echo ========================================================
+echo   全部依赖安装完成！你可以直接双击运行主程序或网页大屏了！
+echo ========================================================
+pause

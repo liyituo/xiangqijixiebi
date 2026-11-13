@@ -1,0 +1,73 @@
+{
+    "robot_model": "myCobot Pro 450",
+    "recorded_at": "2026-11-10T17:52:24.099921",
+    "total_waypoints": 3,
+    "waypoints": [
+        {
+            "index": 1,
+            "name": "P1",
+            "timestamp": "17:52:24",
+            "joint_angles_deg": [
+                -0.67,
+                14.61,
+                -25.0,
+                10.0,
+                0.0,
+                0.0
+            ],
+            "cartesian_coords_mm": [
+                178.25,
+                1.1,
+                180.0,
+                -180.0,
+                0.0,
+                0.0
+            ],
+            "gripper_percent": 100
+        },
+        {
+            "index": 2,
+            "name": "P_PICK",
+            "timestamp": "17:52:24",
+            "joint_angles_deg": [
+                0.18,
+                14.9,
+                -25.0,
+                10.0,
+                0.0,
+                0.0
+            ],
+            "cartesian_coords_mm": [
+                176.71,
+                2.87,
+                180.0,
+                -180.0,
+                0.0,
+                0.0
+            ],
+            "gripper_percent": 100
+        },
+        {
+            "index": 3,
+            "name": "P_LIFT",
+            "timestamp": "17:52:24",
+            "joint_angles_deg": [
+                0.86,
+                15.04,
+                -25.0,
+                10.0,
+                0.0,
+                0.0
+            ],
+            "cartesian_coords_mm": [
+                178.54,
+                3.1,
+                180.0,
+                -180.0,
+                0.0,
+                0.0
+            ],
+            "gripper_percent": 0
+        }
+    ]
+}
